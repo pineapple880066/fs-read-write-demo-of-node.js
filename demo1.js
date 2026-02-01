@@ -1,6 +1,13 @@
 import FileSystem from "fs";
 import path from "path";
 
+const IGNORE_DIRS = new Set([ // 忽略这些目录
+    "node_modules",
+    ".git",
+    "dist",
+    "build"
+]);
+
 console.log("program start");
 
 function scanDir(dir) {
@@ -21,7 +28,10 @@ function scanDir(dir) {
     function walk(currentDir) {
         const entries = FileSystem.readdirSync(currentDir);
 
-        for (const entry of entries) {
+        for (const entry of entries) { // 遍历目录项
+            if (IGNORE_DIRS.has(entry)) {
+                continue; // 忽略指定目录
+            }
             const fullPath = path.join(currentDir, entry);
             const stat = FileSystem.statSync(fullPath);
             if (stat.isDirectory()) {
