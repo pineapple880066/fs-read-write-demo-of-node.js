@@ -1,3 +1,4 @@
+// 导入 fs 和 path 模块
 import FileSystem from "fs";
 import path from "path";
 
@@ -13,9 +14,23 @@ console.log("program start"); // 提示开始运行
 function scanJsFiles(dir, options = {}) { // 只负责扫描目录，返回.js文件相对路径数组
     let result = [];
 
-    const ignoreDirs = options.ignoreDirs || IGNORE_DIRS;
-    const exts = (options.exts ?? [".js"].map(e => e.startsWith(".") ? e : '.' + e));
-    // 双问号运算符：如果options.exts存在且不为null，则使用它，否则使用后面的默认值
+    const ignoreDirs = options.ignoreDirs || IGNORE_DIRS; // 忽略目录集合 默认IGNORE_DIRS
+
+    let rawExts;
+    if (options.exts) {
+        rawExts = options.exts;
+    } else {
+        rawExts = ['.js'];
+    }
+    let exts = [];
+
+    for (const e of rawExts) { // 规范化扩展名
+        if (e.startsWith('.')) { // 如果是.开头，直接放入
+            exts.push(e);
+        } else {
+            exts.push('.' + e); // 如果不是.开头，加上.再放进去
+        }
+    }
 
     // 检查路径是否存在
     if (!FileSystem.existsSync(dir)) {
@@ -80,10 +95,13 @@ function main() {
         } else if (a === '--ext' && i + 1 < args.length) {
             const raw = args[i + 1];
             // 解析扩展名列表
-            exts = raw.split(',').map(s => s.trim().filter(Boolean));
+            exts = raw
+                .split(',') // 按,分割
+                .map(function (s) { return s.trim(); }) // 去掉空格
+                .filter(Boolean); // 把空字符串‘’过滤掉
             i++;
         } else {
-            console.error('Unkown or incomplete option:', a);
+            console.error('Unknown or incomplete option:', a);
             console.error('Usage: node demo1.js <dir> [--out example: result.txt] [--ext example: js, ts, tsx]');
             process.exit(1); // 正常退出程序
         }
@@ -92,7 +110,8 @@ function main() {
         // 扫描目录并写入结果文件
         const files = scanJsFiles(dir, { exts }); // 收到的目录数组 或者还有 指定拓展名的数组
         writeResultToFile(files, outFile); // 写入指定的outFile
-        console.log('result written to ' + outFile + ' ' + files.length + ' files'); 
+          // 写入了XXX.txt , XX数量个 file
+        console.log('result written to ' + outFile + ' ' + files.length + ' files');
     } catch (err) {
         console.log('Error: ', (err && err.message) ? err.message : String(err));
         process.exit(1);
