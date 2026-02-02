@@ -14,9 +14,11 @@
 # 默认扫描 ./text（若不存在会报错）
 node demo.js
 
-# 指定要扫描的目录，例如扫描当前仓库的 file_nodejs_demo：
+# 指定要扫描的目录，例如扫描当前仓库的 ./file_nodejs_demo：
 node demo.js ./file_nodejs_demo
 ```
+# 对于运行demo1.js: (扫描同目录下的./text目录, 指定文件result.txt, 扫描指定后缀的.js, .txt, .cpp文件)
+node demo1.js ./text --out result.txt --ext 'js, txt, cpp'
 
 输出
 - 脚本成功运行后，会在运行目录生成或覆盖 `result.txt`，内容为找到的每个 `.js` 文件的绝对或相对路径（每行一条）。
