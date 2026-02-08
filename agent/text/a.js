@@ -11,9 +11,9 @@ const RAG_TOP_K = Number(process.env.RAG_TOP_K || 8);
 const RAG_READ_CHARS = Number(process.env.RAG_READ_CHARS || 4000);
 const STOP_WORDS = new Set(['的', '了', '和', '是', '在', '我', '要', '把', 'to', 'the', 'a', 'an', 'for', 'and', 'or', 'is', 'are']);
 
-// 最小扫描: (递归 + ignore + ext)
 const IGNORE_DIRS = new Set(['node_modules', '.git', 'dist', 'build']);
 
+// 最小扫描: (递归 + ignore + ext)
 function scanFiles(rootDir, exts = ['.js', '.ts', '.tsx', '.json', '.md', '.txt']) {
     const result = [];
     // walk只负责递归扫描目录
@@ -57,32 +57,43 @@ function readTextSafe(filePath, maxChars = 6000) {
 }
 
 function tokenize(text) {
-    return String(text.tolowerCase().split(/[^a-z0-0_\u4e00-\u9fa5]+/).fliter(t => t && !STOP_WORDS.has(t) && t.length > 1));
+    //   转化为字符串string   全部变小写       空格，逗号，括号会被当成分隔符         过滤空字符，      去掉停用词             去掉单字符
+    return String(text).toLowerCase().split(/[^a-z0-0_\u4e00-\u9fa5]+/).fliter(t => t && !STOP_WORDS.has(t) && t.length > 1);
 }
-
+// 相关性打分             
 function scoreFileByTask(task, relPath, contentHead) {
-    const q = tokenize(task);
-    const pathTokens = tokenize(relPath);
-    const bodyTokens = tokenize(contentHead);
+    const q = tokenize(task);                   // 分割task
+    const pathTokens = tokenize(relPath);       // ..
+    const bodyTokens = tokenize(contentHead);   //
 
-    let score = 0;
-    for (const t of q) {
-        if (pathTokens.includes(t)) score += 3;
-        if (bodyTokens.includes(t)) score += 1;
+    let score = 0; // 分数
+    for (const t of q) { // 遍历所有被分隔开的 words
+        if (pathTokens.includes(t)) score += 3; // 路径中包含task 加三分
+        if (bodyTokens.includes(t)) score += 1; // 正文中包含task 加一分
     }
-    if (/readme|index|main|app/i.test(relPath)) score += 0.5;
+
+    if (/readme|index|main|app/i.test(relPath)) score += 0.5; // 如果文件路径里包含readme,index,main,app这些词会加0.5分(解释说明型)
+    //  正则表达式               i 表示忽略大小写    test(Boolean)表示正则匹配relPath
     return score;
+}   
+
+// 选择相关性高的文件
+function pickRelevantFiles({ rootDir, files, userTask, topK = RAG_TOP_K }) {
+    const scored = files.map(fp => { // 按照绝对路径
+        const rel = path.relative(rootDir, fp); // 找到相关路径
+        const head = readTextSafe(fp, 1200); // 只读前1200个字符
+
+         // 返回绝对路径，相对路径，分数用scoreFileByTask计算
+        return { fp, rel, score: scoreFileByTask(userTask, rel, head) };
+    }).sort((a, b) => b.score - a.score); // 分数从高到低排序
+
+    const picked = scored.filter(x => x.score > 0).slice(0, topK); // 去掉0分的文件
+
+    return picked.length ? picked : scored.slice(0, topK);
+     // 有一个及以上的正分的文件，就只用他们
+    // 否则只用前 topK 个文件(避免返回空列表导致没有上下文)
 }
 
-function pickRelevantFiles({ rootDir, files, userTask, topK = RAG_TOP_K }) {
-    const scored = files.map(fp => {
-        const rel = path.relative(rootDir, fp);
-        const head = readTextSafe(fp, 1200);
-        return { fp, rel, score: scoreFileByTask(userTask, rel, head) };
-    }).sort((a, b) => b.score - a.score);
-    const picked = scored.filter(x => x.score > 0).slice(0, topK);
-    return picked.length ? picked : scored.slice(0, topK);
-}
 // 提示词的建立
 function buildPrompt({ userTask, rootDir, files, picked, fileBlobs }) {
     // 用户的prompt里面出现总结或者summary的时候，切换总结模式
@@ -250,14 +261,15 @@ Follow the required JSON schema strictly.`;
 
 async function main() {
     const args = process.argv.slice(2);
-    if (args.length < 2) {
+
+    if (args.length < 2) { // 如果没有后面的 目录 以及 task 返回错误
         console.error('Usage: node agent.js <project_dir> "<task>"');
         console.error('Env: LLM_BASE_URL, LLM_API_KEY, (optional) LLM_MODEL');
         process.exit(1);
     }
 
-    const rootDir = args[0];
-    const userTask = args.slice(1).join(' ');
+    const rootDir = args[0];                        // 第一个参数是根目录(其实是目标目录)
+    const userTask = args.slice(1).join(' ');       // 第二个参数是用户给出的任务task
 
     try {
         const files = scanFiles(rootDir);
