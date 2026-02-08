@@ -15,9 +15,9 @@ export function retrieveByBm25({ rootDir, files, query, topK = RAG_TOP_K, stopWo
     const index = buildBm25Index(chunks, stopWords); // 建立索引 ， 计算所有chunks平均长度
     const results = bm25Search(index, query, stopWords, topK); // 计算bm25并且取 前topK个
 
-    return results
-        .filter(item => item.score > 0)
-        .map( ({ doc, score }) => ({
+    const postive = results.filter(item => item.score > 0);
+    const picked = postive.length > 0 ? postive : results;
+    return picked.map( ({ doc, score }) => ({
             id: doc.id,
             relPath: doc.relPath,
             text: doc.text,
@@ -44,7 +44,7 @@ export function buildContextFromHits(hits, maxChars = RAG_READ_CHARS * 2) {
 
         const raw = String(h.text || ''); // 未处理的
         const clipped = raw.length > remain // 处理: 如果原文长度大于可用的，只取前remain个字符
-            ? `${raw.slice(0, remain)}\n...<truncted>...`
+            ? `${raw.slice(0, remain)}\n...<truncated>...`
             : raw;
         
         sections.push(`${header}${clipped}\n`); // 上下文加入 header , 处理过的chunk.text
