@@ -36,7 +36,7 @@ export function buildBm25Index(chunks, stopWords) { // 建立索引， 并且算
     };
 }
 
-// 给每个文档计算一个 分数 然后去前 TOP_K 个
+// 给每个文档计算一个 分数 然后取前 TOP_K 个
 export function bm25Search(index, query, stopWords, topK = 8) {
     const k1 = 1.2; // 词频饱和度 (词频越大， 分数越高，但增长越来越缓慢，k1越大，增长越快)
     const b = 0.75; // 控制长度归一化， 文档越长，越容易产生查询词， 需要做惩罚，b = 0表示不惩罚长度， b = 1表示完全按长度惩罚
