@@ -1,7 +1,0 @@
-a.js
-b.txt
-d.js
-text2/1.js
-text2/2.js
-text2/test3/3.js
-text2/test3/4.js

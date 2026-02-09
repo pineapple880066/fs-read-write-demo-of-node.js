@@ -1,7 +1,4 @@
 /.DS_Store
 /.vscode
-/css_demo
-/file_nodejs_demo
-/first_demo
-/nodeJS_demo
-/result.txt
+/javascript_demo
+agent.js
