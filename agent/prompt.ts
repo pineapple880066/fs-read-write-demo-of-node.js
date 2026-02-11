@@ -1,30 +1,50 @@
-const MODES = new Set(['summary', 'code', 'chat']); // 三种模式
+import type { AgentMode, RetrievedHit } from './types.js';
 
- // 保证是三种模式之一，否则就是 chat 模式
-function safeMode(mode) {
-    return MODES.has(mode) ? mode : 'chat';
+// 允许的 prompt 模式集合
+const MODES = new Set<AgentMode>(['summary', 'code', 'chat']);
+
+// prompt 里只需要 hits 的一小部分字段
+type PromptHit = Pick<RetrievedHit, 'id' | 'relPath' | 'score'>;
+
+interface PromptInput {
+    mode: AgentMode | string;
+    userTask: string;
+    hits: PromptHit[];
+    context: string;
 }
 
-function formatHitList(hits) {  // 格式化处理hits结果(命中chunks)
+interface PromptParts {
+    userTask: string;
+    fileList: string;
+    hitList: string;
+    context: string;
+}
+
+// 非法 mode 自动降级为 chat
+function safeMode(mode: AgentMode | string): AgentMode {
+    return MODES.has(mode as AgentMode) ? (mode as AgentMode) : 'chat';
+}
+
+// 把 chunk 命中列表格式化成多行字符串
+function formatHitList(hits: PromptHit[]): string {
     if (!hits.length) return '(none)';
-    return hits
-        .map((h, i) => `${i + 1}. ${h.relPath}#${h.id} (score=${h.score})`) // 每个命中的文件用固定格式给出
-        .join('\n');
+    return hits.map((h, i) => `${i + 1}. ${h.relPath}#${h.id} (score=${h.score})`).join('\n');
 }
 
-function formatFileList(hits) { // 处理file路径(去重)(命中file或者document)
+// 从 hits 提取去重后的文件列表
+function formatFileList(hits: PromptHit[]): string {
     const uniq = [...new Set(hits.map(h => h.relPath))];
     if (!uniq.length) return '- (none)';
     return uniq.map(p => `- ${p}`).join('\n');
 }
 
- // 保证 context 非空
-function safeContext(context) {
-    return context && context.trim() ? context : '(no retrieved context)'; // trim()去掉 context 首尾空格
+// context 为空时给占位，避免 prompt 结构断裂
+function safeContext(context: string): string {
+    return context && context.trim() ? context : '(no retrieved context)';
 }
 
-// summary
-function buildSummaryPrompt({ userTask, fileList, hitList, context }) {
+// 总结模式 prompt：输出 summary schema
+function buildSummaryPrompt({ userTask, fileList, hitList, context }: PromptParts): string {
     return `
 You are a software analyst. Summarize strictly based on retrieved chunks.
 Do NOT propose refactors or code edits unless explicitly requested.
@@ -49,8 +69,9 @@ Return ONLY valid JSON (no markdown, no extra text) with this schema:
 }
 `;
 }
-// code
-function buildCodePrompt({ userTask, fileList, hitList, context }) {
+
+// 代码模式 prompt：输出 plan + diffs schema
+function buildCodePrompt({ userTask, fileList, hitList, context }: PromptParts): string {
     return `
 You are a coding assistant agent.
 Goal: produce concrete code changes for the user task.
@@ -87,8 +108,9 @@ If no changes are needed, return:
 { "plan": ["no changes"], "diffs": [] }
 `;
 }
-// chat
-function buildChatPrompt({ userTask, fileList, hitList, context }) {
+
+// 聊天模式 prompt：输出 answer/evidence/gaps/next_steps
+function buildChatPrompt({ userTask, fileList, hitList, context }: PromptParts): string {
     return `
 You are a pragmatic engineering mentor.
 Answer the user's question based on retrieved context. Do not output code diffs.
@@ -116,7 +138,8 @@ Return ONLY valid JSON (no markdown, no extra text) with this schema:
 `;
 }
 
-export function buildPrompt({ mode, userTask, hits, context }) {
+// 统一 prompt 入口：根据 mode 分发到不同模板
+export function buildPrompt({ mode, userTask, hits, context }: PromptInput): string {
     const pickedMode = safeMode(mode);
     const hitList = formatHitList(hits || []);
     const fileList = formatFileList(hits || []);

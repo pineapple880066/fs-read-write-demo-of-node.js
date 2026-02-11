@@ -1,4 +1,7 @@
 /.DS_Store
 /.vscode
 /javascript_demo
-agent.js
+/agent/node_modules
+/agent/dist
+/agent_server_go/bin
+/agent_server_go/.env
