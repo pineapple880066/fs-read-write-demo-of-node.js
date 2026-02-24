@@ -1,3 +1,7 @@
+-- 初始化核心业务表：
+-- users / sessions / messages / documents / chunks / retrieval_logs / tasks
+-- 当前是第一版固定 schema，后续变更建议新增 migration，而不是直接修改本文件。
+
 CREATE TABLE IF NOT EXISTS users (
   id BIGINT PRIMARY KEY AUTO_INCREMENT,
   tenant_id VARCHAR(64) NOT NULL,

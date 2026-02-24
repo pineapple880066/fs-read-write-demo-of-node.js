@@ -8,10 +8,10 @@ import (
 	"agent_server_go/internal/mq/rabbitmq"
 )
 
-// StartTaskConsumer is week-5 async worker entry.
-// Current implementation is a lightweight scaffold and should be replaced
-// by real ingest/embedding/reindex pipeline handlers.
+// StartTaskConsumer 启动 MQ 消费者（当前是周5阶段的占位骨架）。
+// 后续会在这里替换成真实的 ingest / chunk / embedding / reindex 流程。
 func (s *Services) StartTaskConsumer(ctx context.Context) {
+	// 没有 MQ 或 DB 时直接跳过，避免本地最小环境启动失败
 	if s.MQ == nil || s.Store == nil {
 		return
 	}
@@ -19,12 +19,13 @@ func (s *Services) StartTaskConsumer(ctx context.Context) {
 	err := s.MQ.ConsumeTasks(ctx, func(ctx context.Context, msg rabbitmq.TaskMessage) error {
 		log.Printf("consume task: id=%s type=%s tenant=%s", msg.TaskID, msg.Type, msg.TenantID)
 
+		// 处理前先把任务状态改成 running
 		_ = s.Store.UpdateTaskStatus(ctx, msg.TaskID, "running", nil)
 
 		// Simulate task processing.
 		time.Sleep(100 * time.Millisecond)
 
-		// Placeholder status update pattern.
+		// 占位处理成功后更新状态；后续需要补 retry / dlq / 错误记录
 		return s.Store.UpdateTaskStatus(ctx, msg.TaskID, "success", nil)
 	})
 	if err != nil {

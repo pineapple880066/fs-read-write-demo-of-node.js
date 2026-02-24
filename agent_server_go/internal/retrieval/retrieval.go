@@ -6,6 +6,7 @@ import (
 )
 
 type Hit struct {
+	// Hit 用于内部检索/融合排序场景，字段比 API SearchHit 更完整
 	ChunkID       string  `json:"chunk_id"`
 	RelPath       string  `json:"rel_path"`
 	Score         float64 `json:"score"`
@@ -16,6 +17,7 @@ type Hit struct {
 }
 
 func Normalize(v, maxV float64) float64 {
+	// 把分数压缩到 [0,1]，便于不同来源分数融合
 	if maxV <= 0 {
 		return 0
 	}
@@ -32,10 +34,12 @@ func Normalize(v, maxV float64) float64 {
 // Final fusion score fixed by plan:
 // final = 0.45*bm25_norm + 0.30*dense_norm + 0.15*query_coverage + 0.10*path_boost
 func FuseScore(bm25Norm, denseNorm, queryCoverage, pathBoost float64) float64 {
+	// 融合公式权重与计划文档保持一致，便于对照验收
 	return 0.45*bm25Norm + 0.30*denseNorm + 0.15*queryCoverage + 0.10*pathBoost
 }
 
 func SanitizeQueries(userTask string, rewritten []string) []string {
+	// 合并用户原始 query 与改写 query，并做去重/裁剪
 	merged := make([]string, 0, 6)
 	merged = append(merged, strings.TrimSpace(userTask))
 	for _, q := range rewritten {
@@ -56,6 +60,7 @@ func SanitizeQueries(userTask string, rewritten []string) []string {
 		}
 		seen[q] = struct{}{}
 		out = append(out, q)
+		// 控制 query 数量，避免检索成本失控
 		if len(out) >= 4 {
 			break
 		}
@@ -64,6 +69,7 @@ func SanitizeQueries(userTask string, rewritten []string) []string {
 }
 
 func SortHits(hits []Hit) {
+	// 先按融合分降序；分数相同再按 BM25 分排序，保证结果稳定
 	sort.SliceStable(hits, func(i, j int) bool {
 		if hits[i].Score == hits[j].Score {
 			return hits[i].BM25Score > hits[j].BM25Score

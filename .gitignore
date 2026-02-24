@@ -6,3 +6,4 @@
 /agent_server_go/bin
 /agent_server_go/.env
 /agent_server_go_rebuild
+/go_demo

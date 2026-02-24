@@ -1,5 +1,6 @@
 package service
 
+// ChatRequest 对应 POST /v1/chat 的入参
 type ChatRequest struct {
 	TenantID  string `json:"tenant_id"`
 	SessionID string `json:"session_id"`
@@ -8,6 +9,7 @@ type ChatRequest struct {
 	Mode      string `json:"mode"`
 }
 
+// ChatResponse 对应 POST /v1/chat 的出参
 type ChatResponse struct {
 	Answer         string        `json:"answer"`
 	EvidenceFiles  []string      `json:"evidence_files"`
@@ -15,6 +17,7 @@ type ChatResponse struct {
 	TaskID         string        `json:"task_id,omitempty"`
 }
 
+// IngestRequest 对应 POST /v1/ingest 的入参
 type IngestRequest struct {
 	TenantID   string `json:"tenant_id"`
 	SourceType string `json:"source_type"`
@@ -22,17 +25,20 @@ type IngestRequest struct {
 	Text       string `json:"text,omitempty"`
 }
 
+// IngestResponse 返回异步任务 id 与初始状态
 type IngestResponse struct {
 	TaskID string `json:"task_id"`
 	Status string `json:"status"`
 }
 
+// SearchRequest 对应 POST /v1/search 的入参
 type SearchRequest struct {
 	TenantID string `json:"tenant_id"`
 	Query    string `json:"query"`
 	TopK     int    `json:"top_k"`
 }
 
+// SearchHit 是检索结果中的单条命中（chunk 级别）
 type SearchHit struct {
 	ChunkID    string  `json:"chunk_id"`
 	RelPath    string  `json:"rel_path"`
@@ -41,10 +47,12 @@ type SearchHit struct {
 	DenseScore float64 `json:"dense_score"`
 }
 
+// SearchResponse 对应 /search 的统一数据部分
 type SearchResponse struct {
 	Hits []SearchHit `json:"hits"`
 }
 
+// TaskResponse 对应 GET /v1/tasks/:id 的返回
 type TaskResponse struct {
 	TaskID       string `json:"task_id"`
 	Status       string `json:"status"`
@@ -53,6 +61,7 @@ type TaskResponse struct {
 	ResultRef    string `json:"result_ref,omitempty"`
 }
 
+// RetrievalMeta 用于 /chat 返回调试信息，便于观察检索行为
 type RetrievalMeta struct {
 	Query         string   `json:"query"`
 	Rewritten     []string `json:"rewritten_queries"`

@@ -8,6 +8,7 @@ import (
 )
 
 type AgentHandler struct {
+	// handler 只负责 HTTP 层协议转换，业务逻辑放在 service
 	Svc *service.Services
 }
 
@@ -16,15 +17,18 @@ func NewAgentHandler(svc *service.Services) *AgentHandler {
 }
 
 func (h *AgentHandler) Chat(c *fiber.Ctx) error {
+	// 1) 解析 JSON 请求体到 service 层请求结构
 	var req service.ChatRequest
 	if err := c.BodyParser(&req); err != nil {
 		return response.Error(c, fiber.StatusBadRequest, "BAD_REQUEST", err.Error())
 	}
 
+	// 2) 调用业务层
 	out, err := h.Svc.Chat(c.UserContext(), req)
 	if err != nil {
 		return response.Error(c, fiber.StatusBadRequest, "CHAT_FAILED", err.Error())
 	}
+	// 3) 返回统一成功体
 	return response.JSON(c, fiber.StatusOK, out)
 }
 
@@ -42,6 +46,7 @@ func (h *AgentHandler) Ingest(c *fiber.Ctx) error {
 }
 
 func (h *AgentHandler) Search(c *fiber.Ctx) error {
+	// /search 是最容易单独调试的接口，用来验证检索链路
 	var req service.SearchRequest
 	if err := c.BodyParser(&req); err != nil {
 		return response.Error(c, fiber.StatusBadRequest, "BAD_REQUEST", err.Error())
@@ -55,6 +60,7 @@ func (h *AgentHandler) Search(c *fiber.Ctx) error {
 }
 
 func (h *AgentHandler) GetTask(c *fiber.Ctx) error {
+	// 路径参数示例：/v1/tasks/:id
 	taskID := c.Params("id")
 	out, err := h.Svc.GetTask(c.UserContext(), taskID)
 	if err != nil {
