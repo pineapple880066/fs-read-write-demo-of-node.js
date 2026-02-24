@@ -1,6 +1,12 @@
 package response
-
-import "github.com/gofiber/fiber/v2"
+// 做统一的返回格式
+// 统一成功响应格式
+// 返回成：{ data, request_id }
+// 统一错误响应格式
+// 返回成：{ code, message, request_id }
+import (
+	"github.com/gofiber/fiber/v2"
+)
 
 type SuccessBody struct {
 	// data 承载真实业务返回

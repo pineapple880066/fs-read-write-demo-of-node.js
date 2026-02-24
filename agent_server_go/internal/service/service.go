@@ -44,14 +44,14 @@ func (s *Services) Chat(ctx context.Context, req ChatRequest) (ChatResponse, err
 	}
 
 	// 2) 生成 query 变体（当前是启发式示例，后续可换成 LLM query rewrite）
-	rewritten := retrieval.SanitizeQueries(req.Message, []string{
+	rewritten := retrieval.SanitizeQueries(req.Message, []string{ // 合并原始 query + 补充 query，并做去重裁剪
 		"source code architecture",
 		"retrieval pipeline",
 		strings.ToLower(req.Mode),
 	})
 
 	// 3) 调用搜索接口拿候选上下文（这里复用 Search 逻辑，避免重复代码）
-	searchResp, err := s.Search(ctx, SearchRequest{
+	searchResp, err := s.Search(ctx, SearchRequest{ // 复用搜索能力，为 chat 提供证据片段
 		TenantID: req.TenantID,
 		Query:    req.Message,
 		TopK:     8,
@@ -71,7 +71,7 @@ func (s *Services) Chat(ctx context.Context, req ChatRequest) (ChatResponse, err
 	if s.Model != nil {
 		// 当前 prompt 是最小版本，后续应拆到 prompt builder
 		prompt := fmt.Sprintf("Task: %s\nEvidence: %v\nReturn concise Chinese answer.", req.Message, evidence)
-		content, modelErr := s.Model.Chat(ctx, []modelgateway.ChatMessage{{Role: "user", Content: prompt}}, 0.2)
+		content, modelErr := s.Model.Chat(ctx, []modelgateway.ChatMessage{{Role: "user", Content: prompt}}, 0.2) // 调 LLM 生成回答
 		if modelErr == nil {
 			answer = content
 		}
@@ -82,7 +82,7 @@ func (s *Services) Chat(ctx context.Context, req ChatRequest) (ChatResponse, err
 
 	// 6) 记录检索日志（失败不影响主流程）
 	if s.Store != nil {
-		_ = s.Store.InsertRetrievalLog(ctx, mysql.RetrievalLog{
+		_ = s.Store.InsertRetrievalLog(ctx, mysql.RetrievalLog{ // 写入检索日志，便于后续分析
 			TenantID:   req.TenantID,
 			SessionID:  req.SessionID,
 			Query:      req.Message,
@@ -112,18 +112,18 @@ func (s *Services) Ingest(ctx context.Context, req IngestRequest) (IngestRespons
 
 	// 使用时间戳生成任务 id（简单可用，后续可替换成 UUID）
 	taskID := fmt.Sprintf("task_%d", time.Now().UnixNano())
-	msg := rabbitmq.TaskMessage{
+	msg := rabbitmq.TaskMessage{ // 组装异步任务消息体（后续发到 MQ）
 		TaskID:     taskID,
 		TenantID:   req.TenantID,
 		Type:       "ingest",
-		Payload:    mysql.MustJSON(req),
+		Payload:    mysql.MustJSON(req), // 把 ingest 请求序列化为 JSON，放入任务 payload
 		RetryCount: 0,
 		CreatedAt:  time.Now().UTC(),
 	}
 
 	if s.Store != nil {
 		// 先落库任务状态为 pending，便于 /tasks 查询
-		err := s.Store.CreateTask(ctx, mysql.TaskRecord{
+		err := s.Store.CreateTask(ctx, mysql.TaskRecord{ // 先创建任务记录，状态 pending
 			TaskID:      taskID,
 			TenantID:    req.TenantID,
 			Type:        "ingest",
@@ -137,7 +137,7 @@ func (s *Services) Ingest(ctx context.Context, req IngestRequest) (IngestRespons
 
 	if s.MQ != nil {
 		// 写入消息队列，交给 worker 异步处理
-		if err := s.MQ.PublishTask(msg); err != nil {
+		if err := s.MQ.PublishTask(msg); err != nil { // 将任务消息发布到 RabbitMQ
 			return IngestResponse{}, err
 		}
 	}
@@ -159,7 +159,7 @@ func (s *Services) Search(ctx context.Context, req SearchRequest) (SearchRespons
 	cacheKey := fmt.Sprintf("search:%s:%d:%s", req.TenantID, req.TopK, strings.TrimSpace(req.Query))
 	if s.Cache != nil {
 		var cached SearchResponse
-		if ok, err := s.Cache.GetJSON(ctx, cacheKey, &cached); err == nil && ok {
+		if ok, err := s.Cache.GetJSON(ctx, cacheKey, &cached); err == nil && ok { // 命中缓存则直接返回
 			return cached, nil
 		}
 	}
@@ -180,7 +180,7 @@ func (s *Services) Search(ctx context.Context, req SearchRequest) (SearchRespons
 		queryCoverage := 1.0
 		pathBoost := 0.2
 		// 使用 retrieval 包中的融合公式，保证与计划一致
-		finalScore := retrieval.FuseScore(retrieval.Normalize(bm25, 1.0), retrieval.Normalize(dense, 1.0), queryCoverage, pathBoost)
+		finalScore := retrieval.FuseScore(retrieval.Normalize(bm25, 1.0), retrieval.Normalize(dense, 1.0), queryCoverage, pathBoost) // 按计划公式做融合打分
 
 		hits = append(hits, SearchHit{
 			ChunkID:    fmt.Sprintf("chunk_%d", i+1),
@@ -194,7 +194,7 @@ func (s *Services) Search(ctx context.Context, req SearchRequest) (SearchRespons
 	resp := SearchResponse{Hits: hits}
 	if s.Cache != nil {
 		// 写缓存失败不影响主流程
-		_ = s.Cache.SetJSON(ctx, cacheKey, resp, 2*time.Minute)
+		_ = s.Cache.SetJSON(ctx, cacheKey, resp, 2*time.Minute) // 写搜索缓存，TTL=2分钟
 	}
 
 	return resp, nil
@@ -211,7 +211,7 @@ func (s *Services) GetTask(ctx context.Context, taskID string) (TaskResponse, er
 		return TaskResponse{TaskID: taskID, Status: "pending", Progress: 10}, nil
 	}
 
-	r, err := s.Store.GetTask(ctx, taskID)
+	r, err := s.Store.GetTask(ctx, taskID) // 从 tasks 表读取任务状态
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return TaskResponse{}, errors.New("task not found")

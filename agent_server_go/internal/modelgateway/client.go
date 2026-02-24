@@ -54,8 +54,8 @@ func (c *Client) Chat(ctx context.Context, messages []ChatMessage, temperature f
 	}
 
 	// 1) 组装请求体
-	payload, _ := json.Marshal(chatReq{Model: c.Model, Messages: messages, Temperature: temperature})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/chat/completions", bytes.NewReader(payload))
+	payload, _ := json.Marshal(chatReq{Model: c.Model, Messages: messages, Temperature: temperature})                     // 序列化模型请求体
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/chat/completions", bytes.NewReader(payload)) // 创建带超时/取消能力的 HTTP 请求
 	if err != nil {
 		return "", err
 	}
@@ -65,7 +65,7 @@ func (c *Client) Chat(ctx context.Context, messages []ChatMessage, temperature f
 	req.Header.Set("Content-Type", "application/json")
 
 	// 3) 发起 HTTP 请求
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.HTTP.Do(req) // 发起 HTTP 请求到模型网关
 	if err != nil {
 		return "", err
 	}
@@ -78,11 +78,11 @@ func (c *Client) Chat(ctx context.Context, messages []ChatMessage, temperature f
 
 	// 4) 解析响应并提取第一条内容
 	var out chatResp
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil { // 解析 JSON 响应
 		return "", err
 	}
 	if len(out.Choices) == 0 {
 		return "", fmt.Errorf("empty llm choices")
 	}
-	return out.Choices[0].Message.Content, nil
+	return out.Choices[0].Message.Content, nil // 返回第一条候选的文本内容
 }
