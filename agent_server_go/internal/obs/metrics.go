@@ -13,6 +13,7 @@ type Metrics struct {
 }
 
 func NewMetrics() *Metrics {
+	// NewMetrics 创建并注册 Prometheus 指标，返回项目统一指标对象。
 	// 统一在一个地方创建并注册所有 Prometheus 指标
 	reg := prometheus.NewRegistry()
 	httpRequestsTotal := prometheus.NewCounterVec(

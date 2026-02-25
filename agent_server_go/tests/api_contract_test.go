@@ -15,6 +15,7 @@ import (
 )
 
 func TestSearchContract(t *testing.T) {
+	// TestSearchContract 验证 /v1/search 的基本接口契约（鉴权通过时返回 200）。
 	// 使用最小依赖构造 HTTP 服务：不连 DB/Redis/MQ，只验证 API 契约
 	metrics := obs.NewMetrics()
 	svc := service.New(nil, (*cache.Client)(nil), nil, nil, 5, 10)

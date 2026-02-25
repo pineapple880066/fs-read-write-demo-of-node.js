@@ -1,5 +1,7 @@
 package middleware
 
+// JWT鉴权
+
 import (
 	"strings"
 
@@ -10,18 +12,20 @@ import (
 )
 
 func JWTAuth(secret string) fiber.Handler {
+	// JWTAuth 返回一个鉴权中间件：校验 Bearer Token，并把身份信息写入 Locals。
 	return func(c *fiber.Ctx) error {
 		// 只接受 Bearer Token
 		auth := c.Get("Authorization")
-		if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
+		if auth == "" || !strings.HasPrefix(auth, "Bearer ") { // 为空或者没有Bearer 前缀
 			return response.Error(c, fiber.StatusUnauthorized, "UNAUTHORIZED", "missing bearer token")
 		}
 
-		tokenStr := strings.TrimPrefix(auth, "Bearer ")
-		token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (any, error) {
+		tokenStr := strings.TrimPrefix(auth, "Bearer ")                         // 去掉前缀 "Bearer "，得到纯 token 字符串
+		token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (any, error) { // 解析并验签 token
+			// 返回服务端密钥给 JWT 库，用来校验 token 签名是否正确
 			return []byte(secret), nil
 		})
-		if err != nil || !token.Valid {
+		if err != nil || !token.Valid { // token	是否有效
 			return response.Error(c, fiber.StatusUnauthorized, "UNAUTHORIZED", "invalid token")
 		}
 
@@ -36,6 +40,6 @@ func JWTAuth(secret string) fiber.Handler {
 			}
 		}
 
-		return c.Next()
+		return c.Next() // 鉴权通过，继续后续流程
 	}
 }

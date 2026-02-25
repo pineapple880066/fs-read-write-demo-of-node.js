@@ -7,6 +7,7 @@ import (
 )
 
 func Health(c *fiber.Ctx) error {
+	// Health 处理 /healthz：返回最小健康状态（进程存活）。
 	// 最小健康检查：只表示 HTTP 进程存活，不代表所有依赖都健康
 	return response.JSON(c, fiber.StatusOK, fiber.Map{"status": "ok"})
 }

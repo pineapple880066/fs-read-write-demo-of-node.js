@@ -14,6 +14,7 @@ type Store struct {
 }
 
 func New(dsn string) (*Store, error) {
+	// New 创建 MySQL Store（内部持有 *sql.DB 连接池）。
 	// sql.Open 不会立刻建立连接，真正连通性在 Ping 阶段验证
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
@@ -27,10 +28,12 @@ func New(dsn string) (*Store, error) {
 }
 
 func (s *Store) Ping(ctx context.Context) error {
+	// Ping 检查数据库可连通性（常用于启动探活）。
 	// 启动时健康检查使用
 	return s.DB.PingContext(ctx)
 }
 
 func (s *Store) Close() error {
+	// Close 关闭数据库连接池。
 	return s.DB.Close()
 }

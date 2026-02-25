@@ -8,6 +8,7 @@ import (
 )
 
 func InitTracerProvider() func(context.Context) error {
+	// InitTracerProvider 初始化 OTel tracer provider，并返回关闭函数。
 	// 当前是最小 tracer provider 骨架，后续可接 Jaeger/OTLP exporter
 	tp := trace.NewTracerProvider()
 	otel.SetTracerProvider(tp)

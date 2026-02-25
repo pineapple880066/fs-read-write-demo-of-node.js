@@ -1,4 +1,5 @@
 package response
+
 // 做统一的返回格式
 // 统一成功响应格式
 // 返回成：{ data, request_id }

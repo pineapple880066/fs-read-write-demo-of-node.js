@@ -10,6 +10,11 @@ type Config struct {
 	AppName string
 	AppEnv  string
 	AppPort string
+	// TS RAG 桥接配置（复用 ../agent/dist 下的 TypeScript 检索实现）
+	TSRAGNodeBin      string
+	TSRAGScriptPath   string
+	TSRAGAgentDistDir string
+	TSRAGTargetRoot   string
 	// 基础设施配置
 	MySQLDSN    string
 	RedisAddr   string
@@ -29,20 +34,24 @@ type Config struct {
 func Load() Config {
 	// 集中在这里做环境变量读取，避免业务层到处直接取 os.Getenv
 	return Config{
-		AppName:      getEnv("APP_NAME", "agent-server-go"),
-		AppEnv:       getEnv("APP_ENV", "dev"),
-		AppPort:      getEnv("APP_PORT", "8080"),
-		MySQLDSN:     getEnv("MYSQL_DSN", ""),
-		RedisAddr:    getEnv("REDIS_ADDR", "127.0.0.1:6379"),
-		RedisPass:    getEnv("REDIS_PASSWORD", ""),
-		RabbitMQURL:  getEnv("RABBITMQ_URL", "amqp://guest:guest@127.0.0.1:5672/"),
-		MilvusAddr:   getEnv("MILVUS_ADDR", "127.0.0.1:19530"),
-		LLMBaseURL:   getEnv("LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-		LLMAPIKey:    getEnv("LLM_API_KEY", ""),
-		LLMModel:     getEnv("LLM_MODEL", "qwen3-coder-plus"),
-		JWTSecret:    getEnv("JWT_SECRET", "change_me"),
-		RateLimitRPS: getEnvInt("RATE_LIMIT_RPS", 5),
-		RateBurst:    getEnvInt("RATE_LIMIT_BURST", 10),
+		AppName:           getEnv("APP_NAME", "agent-server-go"),
+		AppEnv:            getEnv("APP_ENV", "dev"),
+		AppPort:           getEnv("APP_PORT", "8080"),
+		TSRAGNodeBin:      getEnv("TS_RAG_NODE_BIN", "node"),
+		TSRAGScriptPath:   getEnv("TS_RAG_SCRIPT_PATH", "scripts/ts_rag_bridge.mjs"),
+		TSRAGAgentDistDir: getEnv("TS_RAG_AGENT_DIST_DIR", "../agent/dist"),
+		TSRAGTargetRoot:   getEnv("TS_RAG_TARGET_ROOT_DIR", "."),
+		MySQLDSN:          getEnv("MYSQL_DSN", ""),
+		RedisAddr:         getEnv("REDIS_ADDR", "127.0.0.1:6379"),
+		RedisPass:         getEnv("REDIS_PASSWORD", ""),
+		RabbitMQURL:       getEnv("RABBITMQ_URL", "amqp://guest:guest@127.0.0.1:5672/"),
+		MilvusAddr:        getEnv("MILVUS_ADDR", "127.0.0.1:19530"),
+		LLMBaseURL:        getEnv("LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+		LLMAPIKey:         getEnv("LLM_API_KEY", ""),
+		LLMModel:          getEnv("LLM_MODEL", "qwen3-coder-plus"),
+		JWTSecret:         getEnv("JWT_SECRET", "change_me"),
+		RateLimitRPS:      getEnvInt("RATE_LIMIT_RPS", 5),
+		RateBurst:         getEnvInt("RATE_LIMIT_BURST", 10),
 	}
 }
 

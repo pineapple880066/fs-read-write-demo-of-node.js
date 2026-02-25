@@ -11,6 +11,7 @@ import (
 // StartTaskConsumer 启动 MQ 消费者（当前是周5阶段的占位骨架）。
 // 后续会在这里替换成真实的 ingest / chunk / embedding / reindex 流程。
 func (s *Services) StartTaskConsumer(ctx context.Context) {
+	// StartTaskConsumer 启动异步任务消费者（当前仅演示状态流转骨架）。
 	// 没有 MQ 或 DB 时直接跳过，避免本地最小环境启动失败
 	if s.MQ == nil || s.Store == nil {
 		return

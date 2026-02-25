@@ -1,8 +1,10 @@
 package middleware
 
+// 中间件:为每个 请求 设置一个 request_id
+// 如果请求没有 request id，就生成一个；然后把它存起来并回给客户端，再继续处理请求
 import (
-	"crypto/rand"
-	"encoding/hex"
+	"crypto/rand"  // 安全生成随机数
+	"encoding/hex" // 进制转换，二进制转化为十六进制字符串
 
 	"github.com/gofiber/fiber/v2"
 )

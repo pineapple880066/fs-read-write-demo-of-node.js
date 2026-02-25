@@ -9,11 +9,13 @@ type AppError struct {
 }
 
 func (e AppError) Error() string {
+	// Error 把 AppError 转成标准 error 字符串。
 	// 实现 error 接口，便于在 Go 标准错误链中使用
 	return fmt.Sprintf("%s: %s", e.Code, e.Message)
 }
 
 func New(code, message string) AppError {
+	// New 创建一个带 code/message 的业务错误对象。
 	// 当前项目里用得不多，后续可统一替换 string error
 	return AppError{Code: code, Message: message}
 }

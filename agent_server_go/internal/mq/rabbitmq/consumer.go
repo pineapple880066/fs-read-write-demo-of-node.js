@@ -11,6 +11,7 @@ import (
 type Handler func(context.Context, TaskMessage) error
 
 func (c *Client) ConsumeTasks(ctx context.Context, h Handler) error {
+	// ConsumeTasks 启动后台消费协程：收到消息后交给业务 handler 处理。
 	// 手动 ack（autoAck=false），由 handler 成功/失败决定 ack/nack
 	msgs, err := c.Channel.Consume("tasks", "", false, false, false, false, nil)
 	if err != nil {
@@ -36,6 +37,7 @@ func (c *Client) ConsumeTasks(ctx context.Context, h Handler) error {
 }
 
 func (c *Client) handleDelivery(ctx context.Context, d amqp.Delivery, h Handler) {
+	// handleDelivery 处理单条消息：反序列化 -> 调 handler -> ack/nack。
 	// 先把消息体反序列化成结构化任务
 	var msg TaskMessage
 	if err := json.Unmarshal(d.Body, &msg); err != nil {

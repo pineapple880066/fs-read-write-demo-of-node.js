@@ -17,6 +17,7 @@ type Hit struct {
 }
 
 func Normalize(v, maxV float64) float64 {
+	// Normalize 将任意分数按 maxV 归一化到 [0,1]。
 	// 把分数压缩到 [0,1]，便于不同来源分数融合
 	if maxV <= 0 {
 		return 0
@@ -34,11 +35,13 @@ func Normalize(v, maxV float64) float64 {
 // Final fusion score fixed by plan:
 // final = 0.45*bm25_norm + 0.30*dense_norm + 0.15*query_coverage + 0.10*path_boost
 func FuseScore(bm25Norm, denseNorm, queryCoverage, pathBoost float64) float64 {
+	// FuseScore 按固定权重融合多路检索特征分数。
 	// 融合公式权重与计划文档保持一致，便于对照验收
 	return 0.45*bm25Norm + 0.30*denseNorm + 0.15*queryCoverage + 0.10*pathBoost
 }
 
 func SanitizeQueries(userTask string, rewritten []string) []string {
+	// SanitizeQueries 合并/清洗 query，输出去重后的前 4 个检索词。
 	// 合并用户原始 query 与改写 query，并做去重/裁剪
 	merged := make([]string, 0, 6)
 	merged = append(merged, strings.TrimSpace(userTask))
@@ -69,6 +72,7 @@ func SanitizeQueries(userTask string, rewritten []string) []string {
 }
 
 func SortHits(hits []Hit) {
+	// SortHits 按融合分（其次 BM25）对命中结果做稳定排序。
 	// 先按融合分降序；分数相同再按 BM25 分排序，保证结果稳定
 	sort.SliceStable(hits, func(i, j int) bool {
 		if hits[i].Score == hits[j].Score {

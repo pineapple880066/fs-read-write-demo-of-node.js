@@ -14,6 +14,7 @@ import (
 	"agent_server_go/internal/modelgateway"
 	"agent_server_go/internal/mq/rabbitmq"
 	"agent_server_go/internal/obs"
+	"agent_server_go/internal/retrieval"
 	"agent_server_go/internal/service"
 	"agent_server_go/internal/store/mysql"
 )
@@ -76,6 +77,13 @@ func main() {
 	// 6) 初始化模型网关与 service 层（聚合业务依赖）
 	model := modelgateway.New(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)             // 创建 OpenAI-compatible 模型客户端
 	svc := service.New(store, redisClient, mq, model, cfg.RateLimitRPS, cfg.RateBurst) // 组装业务服务（service 层）
+	// 可选：桥接到已有 TypeScript RAG（agent/dist/retrieve.js）；失败时 service 会自动回退占位检索。
+	svc.SetTSBridge(retrieval.NewTSBridge(retrieval.TSBridgeConfig{
+		NodeBin:       cfg.TSRAGNodeBin,
+		ScriptPath:    cfg.TSRAGScriptPath,
+		AgentDistDir:  cfg.TSRAGAgentDistDir,
+		TargetRootDir: cfg.TSRAGTargetRoot,
+	}))
 	// 启动异步任务消费者（当前为占位实现）
 	svc.StartTaskConsumer(ctx) // 后台消费 MQ 中的任务消息，并更新任务状态
 

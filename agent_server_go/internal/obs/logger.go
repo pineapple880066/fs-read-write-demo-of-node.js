@@ -11,6 +11,7 @@ type Logger struct {
 }
 
 func NewLogger() *Logger {
+	// NewLogger 创建统一格式日志器（stdout + 固定前缀）。
 	// 统一日志前缀，方便本地多服务联调时快速识别来源
 	return &Logger{Logger: log.New(os.Stdout, "[agent-server] ", log.LstdFlags|log.Lmicroseconds)}
 }

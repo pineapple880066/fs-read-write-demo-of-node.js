@@ -13,10 +13,12 @@ type AgentHandler struct {
 }
 
 func NewAgentHandler(svc *service.Services) *AgentHandler {
+	// NewAgentHandler 创建 HTTP handler，并注入 service 层依赖。
 	return &AgentHandler{Svc: svc}
 }
 
 func (h *AgentHandler) Chat(c *fiber.Ctx) error {
+	// Chat 处理 POST /v1/chat：解析请求、调用 service.Chat、返回统一响应。
 	// 1) 解析 JSON 请求体到 service 层请求结构
 	var req service.ChatRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -33,6 +35,7 @@ func (h *AgentHandler) Chat(c *fiber.Ctx) error {
 }
 
 func (h *AgentHandler) Ingest(c *fiber.Ctx) error {
+	// Ingest 处理 POST /v1/ingest：创建异步导入任务并返回 task_id。
 	var req service.IngestRequest
 	if err := c.BodyParser(&req); err != nil {
 		return response.Error(c, fiber.StatusBadRequest, "BAD_REQUEST", err.Error())
@@ -46,6 +49,7 @@ func (h *AgentHandler) Ingest(c *fiber.Ctx) error {
 }
 
 func (h *AgentHandler) Search(c *fiber.Ctx) error {
+	// Search 处理 POST /v1/search：返回检索结果（当前是可调试的占位实现）。
 	// /search 是最容易单独调试的接口，用来验证检索链路
 	var req service.SearchRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -60,6 +64,7 @@ func (h *AgentHandler) Search(c *fiber.Ctx) error {
 }
 
 func (h *AgentHandler) GetTask(c *fiber.Ctx) error {
+	// GetTask 处理 GET /v1/tasks/:id：查询异步任务状态。
 	// 路径参数示例：/v1/tasks/:id
 	taskID := c.Params("id")
 	out, err := h.Svc.GetTask(c.UserContext(), taskID)
