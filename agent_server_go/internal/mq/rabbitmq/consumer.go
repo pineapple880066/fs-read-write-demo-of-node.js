@@ -45,7 +45,7 @@ func (c *Client) handleDelivery(ctx context.Context, d amqp.Delivery, h Handler)
 		return
 	}
 
-	// handler 失败时 Nack（不重回队列）；后续可扩展为重试/死信策略
+	// handler 失败时 Nack（不重回队列）；后续可扩展为重试/死信策略 DLQ
 	if err := h(ctx, msg); err != nil {
 		log.Printf("task handler failed: task_id=%s err=%v", msg.TaskID, err)
 		_ = d.Nack(false, false)

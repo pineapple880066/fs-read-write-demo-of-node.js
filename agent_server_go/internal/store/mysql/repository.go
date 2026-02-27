@@ -20,6 +20,29 @@ type TaskRecord struct {
 	UpdatedAt    time.Time
 }
 
+type DocumentRecord struct {
+	// 对应 documents 表
+	ID         int64
+	TenantID   string
+	SourceType string
+	SourceURI  string
+	Checksum   string
+	Status     string
+	CreatedAt  time.Time
+}
+
+type ChunkRecord struct {
+	// 对应 chunks 表（检索时会读出 text）
+	ID         int64
+	TenantID   string
+	DocumentID int64
+	RelPath    string
+	ChunkIndex int
+	Text       string
+	TokenCount int
+	CreatedAt  time.Time
+}
+
 type RetrievalLog struct {
 	// 对应 retrieval_logs 表
 	TenantID   string
@@ -28,6 +51,81 @@ type RetrievalLog struct {
 	TopK       int
 	HitIDsJSON string
 	LatencyMS  int64
+}
+
+func (s *Store) CreateDocument(ctx context.Context, doc DocumentRecord) (int64, error) {
+	// CreateDocument 写入一条文档记录，返回自增 document_id。
+	res, err := s.DB.ExecContext(ctx, `
+		INSERT INTO documents(tenant_id, source_type, source_uri, checksum, status, created_at)
+		VALUES(?,?,?,?,?,NOW())
+	`, doc.TenantID, doc.SourceType, doc.SourceURI, doc.Checksum, doc.Status)
+	if err != nil {
+		return 0, err
+	}
+	return res.LastInsertId()
+}
+
+func (s *Store) UpdateDocumentStatus(ctx context.Context, documentID int64, status string) error {
+	// UpdateDocumentStatus 更新 documents.status（如 processing/ready/failed）。
+	_, err := s.DB.ExecContext(ctx, `UPDATE documents SET status = ? WHERE id = ?`, status, documentID)
+	return err
+}
+
+func (s *Store) ReplaceDocumentChunks(ctx context.Context, tenantID string, documentID int64, relPath string, chunks []ChunkRecord) error {
+	// ReplaceDocumentChunks 以“先删后插”的方式重建某文档的分块（简化版，便于重跑 ingest）。
+	tx, err := s.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tx.Rollback()
+		}
+	}()
+
+	if _, err = tx.ExecContext(ctx, `DELETE FROM chunks WHERE tenant_id = ? AND document_id = ?`, tenantID, documentID); err != nil {
+		return err
+	}
+
+	for i, c := range chunks {
+		if _, err = tx.ExecContext(ctx, `
+			INSERT INTO chunks(tenant_id, document_id, rel_path, chunk_index, text, token_count, created_at)
+			VALUES(?,?,?,?,?,?,NOW())
+		`, tenantID, documentID, relPath, i, c.Text, c.TokenCount); err != nil {
+			return err
+		}
+	}
+
+	err = tx.Commit()
+	return err
+}
+
+func (s *Store) ListChunksByTenant(ctx context.Context, tenantID string, limit int) ([]ChunkRecord, error) {
+	// ListChunksByTenant 返回某租户最近分块（给简化版检索使用）。
+	if limit <= 0 {
+		limit = 500
+	}
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT id, tenant_id, document_id, rel_path, chunk_index, text, token_count, created_at
+		FROM chunks
+		WHERE tenant_id = ?
+		ORDER BY created_at DESC, id DESC
+		LIMIT ?
+	`, tenantID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]ChunkRecord, 0, limit)
+	for rows.Next() {
+		var c ChunkRecord
+		if err := rows.Scan(&c.ID, &c.TenantID, &c.DocumentID, &c.RelPath, &c.ChunkIndex, &c.Text, &c.TokenCount, &c.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
 }
 
 func (s *Store) CreateTask(ctx context.Context, task TaskRecord) error {

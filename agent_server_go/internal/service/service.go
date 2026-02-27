@@ -107,14 +107,57 @@ func buildPlaceholderSearchHits(topK int) []SearchHit {
 	return hits
 }
 
-func (s *Services) buildRAGMaterials(ctx context.Context, query string, queryVariants []string, topK int) (SearchResponse, string) {
-	// buildRAGMaterials 聚合检索材料：优先用 TS retrieve.ts（含上下文），失败则回退占位命中。
+func (s *Services) searchTenantChunks(ctx context.Context, tenantID, query string, queryVariants []string, topK int) (SearchResponse, string, bool) {
+	// searchTenantChunks 在 MySQL chunks 表上做本地 Hybrid 检索（BM25 + 向量近似），用于跑通 SaaS 闭环。
+	// BM25 部分按 TS 版公式移植；向量部分当前为本地哈希向量近似，后续可替换真实 embedding + Milvus。
+	if s.Store == nil || strings.TrimSpace(tenantID) == "" || strings.TrimSpace(query) == "" {
+		return SearchResponse{}, "", false
+	}
+	all, err := s.Store.ListChunksByTenant(ctx, tenantID, 800)
+	if err != nil || len(all) == 0 {
+		return SearchResponse{}, "", false
+	}
+
+	docs := make([]retrieval.HybridDoc, 0, len(all))
+	for _, ch := range all {
+		docs = append(docs, retrieval.HybridDoc{
+			ID:      ch.ID,
+			RelPath: ch.RelPath,
+			Text:    ch.Text,
+		})
+	}
+
+	hh := retrieval.HybridSearchLocalDocs(docs, query, queryVariants, topK)
+	if len(hh) == 0 {
+		return SearchResponse{}, "", false
+	}
+
+	hits := make([]SearchHit, 0, len(hh))
+	for _, c := range hh {
+		hits = append(hits, SearchHit{
+			ChunkID:    fmt.Sprintf("%d", c.ID),
+			RelPath:    c.RelPath,
+			Score:      c.Score,
+			BM25Score:  c.BM25Score,
+			DenseScore: c.DenseScore,
+		})
+	}
+	contextText := retrieval.BuildContextFromHybridHits(hh, 8000)
+	return SearchResponse{Hits: hits}, contextText, true
+}
+
+func (s *Services) buildRAGMaterials(ctx context.Context, tenantID, query string, queryVariants []string, topK int) (SearchResponse, string) {
+	// buildRAGMaterials 聚合检索材料：优先查租户已导入 chunks；未命中时再用 TS retrieve.ts；最后回退占位命中。
 	// 返回值：
 	// 1) SearchResponse：给 /search API 或 chat 调试信息用（结构化 hits）
 	// 2) string       ：给 /chat prompt / tool 直接使用的打包 context 文本
 	if topK <= 0 {
 		// 调用方没传 topK 时给一个默认值，避免 TS/占位检索收到 0
 		topK = 8
+	}
+	// 优先使用租户已导入的数据（MySQL chunks）。这是 API SaaS 主流程的真实检索来源。
+	if resp, ctxText, ok := s.searchTenantChunks(ctx, tenantID, query, queryVariants, topK); ok {
+		return resp, ctxText
 	}
 	if s.TSBridge != nil && s.TSBridge.Enabled() {
 		// 传给 TS retrieve.ts 时，queryVariants 不需要重复包含原 query。
@@ -149,7 +192,7 @@ func (s *Services) buildRAGMaterials(ctx context.Context, query string, queryVar
 		// 失败时静默降级到占位结果；这样不会因为本地 Node/TS 目录问题影响 API 可用性
 	}
 
-	// 未配置 TS bridge，或 bridge 调用失败时，回退到占位命中（context 返回空字符串）
+	// 未命中租户数据、TS bridge 未配置或调用失败时，回退到占位命中（context 返回空字符串）
 	return SearchResponse{Hits: buildPlaceholderSearchHits(topK)}, ""
 }
 
@@ -161,7 +204,7 @@ func buildChatTools() []modelgateway.ToolDefinition {
 			Type: "function",
 			Function: modelgateway.ToolFunction{
 				Name:        "search_codebase",
-				Description: "Search local codebase using TypeScript RAG (BM25-based) and return ranked hits with packed context.",
+				Description: "Search the local codebase and return ranked hits with packed context for answering code/project questions.",
 				Parameters: map[string]any{
 					"type": "object",
 					"properties": map[string]any{
@@ -223,7 +266,7 @@ func (s *Services) runSearchCodebaseTool(ctx context.Context, req ChatRequest, r
 	mergedVariants = append(mergedVariants, rewritten...)
 	mergedVariants = append(mergedVariants, args.QueryVariants...)
 
-	searchResp, ragContext := s.buildRAGMaterials(ctx, query, mergedVariants, topK)
+	searchResp, ragContext := s.buildRAGMaterials(ctx, req.TenantID, query, mergedVariants, topK)
 	files := make([]string, 0, len(searchResp.Hits))
 	compactHits := make([]map[string]any, 0, len(searchResp.Hits))
 	for _, h := range searchResp.Hits {
@@ -348,7 +391,7 @@ func (s *Services) Chat(ctx context.Context, req ChatRequest) (ChatResponse, err
 	})
 
 	// 3) 获取检索材料：优先用 TS retrieve.ts（命中 + context），失败时回退占位结果
-	searchResp, ragContext := s.buildRAGMaterials(ctx, req.Message, rewritten, 8)
+	searchResp, ragContext := s.buildRAGMaterials(ctx, req.TenantID, req.Message, rewritten, 8)
 	// 这里的 searchResp/ragContext 是“预取”结果：
 	// - 给普通 fallback prompt 直接用
 	// - function-calling 成功时也能作为初始 evidence 参考/兜底
@@ -450,8 +493,25 @@ func (s *Services) Ingest(ctx context.Context, req IngestRequest) (IngestRespons
 	if s.MQ != nil {
 		// 写入消息队列，交给 worker 异步处理
 		if err := s.MQ.PublishTask(msg); err != nil { // 将任务消息发布到 RabbitMQ
+			errMsg := err.Error()
+			if s.Store != nil {
+				_ = s.Store.UpdateTaskStatus(ctx, taskID, "failed", &errMsg)
+			}
 			return IngestResponse{}, err
 		}
+	} else if s.Store != nil {
+		// 开发环境兜底：没配 MQ 时也异步起 goroutine 走同一套任务处理逻辑（方便本地快速验证业务闭环）。
+		go func(m rabbitmq.TaskMessage) {
+			bg, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			defer cancel()
+			_ = s.Store.UpdateTaskStatus(bg, m.TaskID, "running", nil)
+			if err := s.handleTaskMessage(bg, m); err != nil {
+				e := err.Error()
+				_ = s.Store.UpdateTaskStatus(bg, m.TaskID, "failed", &e)
+				return
+			}
+			_ = s.Store.UpdateTaskStatus(bg, m.TaskID, "success", nil)
+		}(msg)
 	}
 
 	// 即使未配置 MQ，也先返回 pending，保证 API 契约稳定
@@ -478,7 +538,7 @@ func (s *Services) Search(ctx context.Context, req SearchRequest) (SearchRespons
 	}
 
 	// 3) 实际检索：优先走 TS retrieve.ts（本地扫目录 + BM25 融合），失败时回退占位命中
-	resp, _ := s.buildRAGMaterials(ctx, req.Query, nil, req.TopK)
+	resp, _ := s.buildRAGMaterials(ctx, req.TenantID, req.Query, nil, req.TopK)
 	if s.Cache != nil {
 		// 写缓存失败不影响主流程
 		_ = s.Cache.SetJSON(ctx, cacheKey, resp, 2*time.Minute) // 写搜索缓存，TTL=2分钟

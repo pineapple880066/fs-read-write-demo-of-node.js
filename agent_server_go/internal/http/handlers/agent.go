@@ -49,7 +49,7 @@ func (h *AgentHandler) Ingest(c *fiber.Ctx) error {
 }
 
 func (h *AgentHandler) Search(c *fiber.Ctx) error {
-	// Search 处理 POST /v1/search：返回检索结果（当前是可调试的占位实现）。
+	// Search 处理 POST /v1/search：返回检索结果（优先查租户已导入 chunks，再回退 TS RAG/占位）。
 	// /search 是最容易单独调试的接口，用来验证检索链路
 	var req service.SearchRequest
 	if err := c.BodyParser(&req); err != nil {

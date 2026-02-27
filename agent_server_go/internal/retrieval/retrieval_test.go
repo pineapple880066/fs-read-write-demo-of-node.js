@@ -23,3 +23,26 @@ func TestSanitizeQueries(t *testing.T) {
 		t.Fatalf("unexpected first query: %s", q[0])
 	}
 }
+
+func TestHybridSearchLocalDocs(t *testing.T) {
+	// TestHybridSearchLocalDocs 验证本地 Hybrid 检索至少能命中相关文本，并产出 BM25/dense 分数。
+	docs := []HybridDoc{
+		{ID: 1, RelPath: "a.txt", Text: "RabbitMQ task queue consumer ack and worker"},
+		{ID: 2, RelPath: "b.txt", Text: "Vector retrieval and cosine similarity hybrid search"},
+		{ID: 3, RelPath: "c.txt", Text: "plain unrelated content"},
+	}
+	hits := HybridSearchLocalDocs(docs, "rabbitmq worker task", nil, 2)
+	if len(hits) == 0 {
+		t.Fatalf("expected hits")
+	}
+	if hits[0].ID != 1 {
+		t.Fatalf("expected doc 1 ranked first, got %d", hits[0].ID)
+	}
+	if hits[0].BM25Score <= 0 {
+		t.Fatalf("expected bm25 score > 0")
+	}
+	// dense 分支为本地哈希向量近似，不要求很高，但应该有非负值
+	if hits[0].DenseScore < 0 {
+		t.Fatalf("expected dense score >= 0")
+	}
+}
