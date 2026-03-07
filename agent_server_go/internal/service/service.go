@@ -2,10 +2,17 @@ package service
 
 import (
 	"context"
+	"crypto/sha1"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -14,6 +21,7 @@ import (
 	"agent_server_go/internal/mq/rabbitmq"
 	"agent_server_go/internal/retrieval"
 	"agent_server_go/internal/store/mysql"
+	"agent_server_go/internal/vector/milvus"
 )
 
 // searchCodebaseToolArgs 是 function-calling 中 search_codebase 的参数结构。
@@ -21,35 +29,86 @@ type searchCodebaseToolArgs struct {
 	Query         string   `json:"query"`
 	QueryVariants []string `json:"query_variants,omitempty"`
 	TopK          int      `json:"top_k,omitempty"`
+	RootDir       string   `json:"root_dir,omitempty"`
+}
+
+type readFileToolArgs struct {
+	Path     string `json:"path"`
+	MaxChars int    `json:"max_chars,omitempty"`
+}
+
+type writeFileToolArgs struct {
+	Path    string `json:"path"`
+	Content string `json:"content"`
 }
 
 type Services struct {
 	// 业务层聚合依赖：数据库、缓存、消息队列、模型网关等
-	Store     *mysql.Store
-	Cache     *redis.Client
-	MQ        *rabbitmq.Client
-	Model     *modelgateway.Client
-	TSBridge  *retrieval.TSBridge
-	RateRPS   int
-	RateBurst int
+	Store             *mysql.Store
+	Cache             *redis.Client
+	MQ                *rabbitmq.Client
+	Model             *modelgateway.Client
+	Vector            *milvus.Client
+	TSBridge          *retrieval.TSBridge
+	RateRPS           int
+	RateBurst         int
+	MemoryMaxMessages int64
+	MemoryTTL         time.Duration
+	// 上下文窗口压缩参数：按模型最大上下文动态计算历史预算。
+	ContextBudgetRatio  float64
+	MinHistoryTokens    int
+	SummaryTargetTokens int
 }
 
 func New(store *mysql.Store, cache *redis.Client, mq *rabbitmq.Client, model *modelgateway.Client, rateRPS int, rateBurst int) *Services {
 	// New 创建 service 层对象（聚合 数据库、缓存、MQ、模型等依赖）。
 	// service 层本身不做复杂初始化，只负责依赖组装
 	return &Services{
-		Store:     store,
-		Cache:     cache,
-		MQ:        mq,
-		Model:     model,
-		RateRPS:   rateRPS,
-		RateBurst: rateBurst,
+		Store:               store,
+		Cache:               cache,
+		MQ:                  mq,
+		Model:               model,
+		RateRPS:             rateRPS,
+		RateBurst:           rateBurst,
+		MemoryMaxMessages:   12,
+		MemoryTTL:           30 * time.Minute,
+		ContextBudgetRatio:  0.78,
+		MinHistoryTokens:    320,
+		SummaryTargetTokens: 320,
 	}
 }
 
 func (s *Services) SetTSBridge(b *retrieval.TSBridge) {
 	// SetTSBridge 注入可选的 TS 检索桥接器；未注入时保留 Go 占位检索逻辑。
 	s.TSBridge = b
+}
+
+func (s *Services) SetVectorClient(v *milvus.Client) {
+	// SetVectorClient 注入 Milvus 向量库客户端；未注入时 dense 检索分支自动跳过。
+	s.Vector = v
+}
+
+// SetMemoryOptions 配置会话短期记忆策略。
+func (s *Services) SetMemoryOptions(maxMessages int, ttlSeconds int) {
+	if maxMessages > 0 {
+		s.MemoryMaxMessages = int64(maxMessages)
+	}
+	if ttlSeconds > 0 {
+		s.MemoryTTL = time.Duration(ttlSeconds) * time.Second
+	}
+}
+
+// SetContextCompressionOptions 配置上下文窗口压缩策略。
+func (s *Services) SetContextCompressionOptions(budgetRatio float64, minHistoryTokens int, summaryTargetTokens int) {
+	if budgetRatio > 0.2 && budgetRatio <= 0.95 {
+		s.ContextBudgetRatio = budgetRatio
+	}
+	if minHistoryTokens > 0 {
+		s.MinHistoryTokens = minHistoryTokens
+	}
+	if summaryTargetTokens > 0 {
+		s.SummaryTargetTokens = summaryTargetTokens
+	}
 }
 
 func mapTSHitsToSearchHits(hits []retrieval.TSRAGHit, topK int) []SearchHit {
@@ -108,8 +167,8 @@ func buildPlaceholderSearchHits(topK int) []SearchHit {
 }
 
 func (s *Services) searchTenantChunks(ctx context.Context, tenantID, query string, queryVariants []string, topK int) (SearchResponse, string, bool) {
-	// searchTenantChunks 在 MySQL chunks 表上做本地 Hybrid 检索（BM25 + 向量近似），用于跑通 SaaS 闭环。
-	// BM25 部分按 TS 版公式移植；向量部分当前为本地哈希向量近似，后续可替换真实 embedding + Milvus。
+	// searchTenantChunks 在 MySQL chunks 表上执行“BM25 + Milvus dense”混合检索。
+	// 当 Milvus 未配置或不可用时，会自动退回纯 BM25。
 	if s.Store == nil || strings.TrimSpace(tenantID) == "" || strings.TrimSpace(query) == "" {
 		return SearchResponse{}, "", false
 	}
@@ -119,35 +178,153 @@ func (s *Services) searchTenantChunks(ctx context.Context, tenantID, query strin
 	}
 
 	docs := make([]retrieval.HybridDoc, 0, len(all))
+	chunkByID := make(map[string]mysql.ChunkRecord, len(all))
 	for _, ch := range all {
 		docs = append(docs, retrieval.HybridDoc{
 			ID:      ch.ID,
 			RelPath: ch.RelPath,
 			Text:    ch.Text,
 		})
+		chunkByID[strconv.FormatInt(ch.ID, 10)] = ch
 	}
 
-	hh := retrieval.HybridSearchLocalDocs(docs, query, queryVariants, topK)
-	if len(hh) == 0 {
+	recallK := topK * 5
+	if recallK < 40 {
+		recallK = 40
+	}
+	if recallK > len(docs) {
+		recallK = len(docs)
+	}
+
+	bm25Hits := retrieval.BM25SearchLocalDocs(docs, query, queryVariants, recallK)
+	type merged struct {
+		chunk         mysql.ChunkRecord
+		rawBM25       float64
+		rawDense      float64
+		queryCoverage float64
+		pathBoost     float64
+	}
+	mergedByID := make(map[string]*merged, len(bm25Hits))
+	maxBM25 := 0.0
+	maxDense := 0.0
+
+	for _, h := range bm25Hits {
+		key := strconv.FormatInt(h.ID, 10)
+		chunk, ok := chunkByID[key]
+		if !ok {
+			continue
+		}
+		mergedByID[key] = &merged{
+			chunk:         chunk,
+			rawBM25:       h.BM25Score,
+			rawDense:      0,
+			queryCoverage: h.QueryCoverage,
+			pathBoost:     h.PathBoost,
+		}
+		if h.BM25Score > maxBM25 {
+			maxBM25 = h.BM25Score
+		}
+	}
+
+	if s.Vector != nil && s.Vector.Enabled() {
+		for _, q := range retrieval.SanitizeQueries(query, queryVariants) {
+			vec := retrieval.HashEmbedText(q)
+			denseHits, denseErr := s.Vector.Search(ctx, tenantID, vec, recallK)
+			if denseErr != nil {
+				log.Printf("milvus search failed: tenant=%s err=%v", tenantID, denseErr)
+				break
+			}
+			for _, h := range denseHits {
+				chunk, ok := chunkByID[h.ChunkID]
+				if !ok {
+					continue
+				}
+				item := mergedByID[h.ChunkID]
+				if item == nil {
+					item = &merged{chunk: chunk}
+					mergedByID[h.ChunkID] = item
+				}
+				if h.Score > item.rawDense {
+					item.rawDense = h.Score
+				}
+				if h.Score > maxDense {
+					maxDense = h.Score
+				}
+			}
+		}
+	}
+
+	if len(mergedByID) == 0 {
 		return SearchResponse{}, "", false
 	}
 
-	hits := make([]SearchHit, 0, len(hh))
-	for _, c := range hh {
+	type hybridHit struct {
+		SearchHit
+		text string
+	}
+	hybridHits := make([]hybridHit, 0, len(mergedByID))
+	for id, item := range mergedByID {
+		score := retrieval.FuseScore(
+			retrieval.Normalize(item.rawBM25, maxBM25),
+			retrieval.Normalize(item.rawDense, maxDense),
+			item.queryCoverage,
+			item.pathBoost,
+		)
+		hybridHits = append(hybridHits, hybridHit{
+			SearchHit: SearchHit{
+				ChunkID:    id,
+				RelPath:    item.chunk.RelPath,
+				Score:      score,
+				BM25Score:  item.rawBM25,
+				DenseScore: item.rawDense,
+			},
+			text: item.chunk.Text,
+		})
+	}
+
+	sort.SliceStable(hybridHits, func(i, j int) bool {
+		if hybridHits[i].Score == hybridHits[j].Score {
+			if hybridHits[i].BM25Score == hybridHits[j].BM25Score {
+				return hybridHits[i].DenseScore > hybridHits[j].DenseScore
+			}
+			return hybridHits[i].BM25Score > hybridHits[j].BM25Score
+		}
+		return hybridHits[i].Score > hybridHits[j].Score
+	})
+	if len(hybridHits) > topK {
+		hybridHits = hybridHits[:topK]
+	}
+
+	hits := make([]SearchHit, 0, len(hybridHits))
+	contextHits := make([]retrieval.HybridDocHit, 0, len(hybridHits))
+	for _, c := range hybridHits {
 		hits = append(hits, SearchHit{
-			ChunkID:    fmt.Sprintf("%d", c.ID),
+			ChunkID:    c.ChunkID,
 			RelPath:    c.RelPath,
 			Score:      c.Score,
 			BM25Score:  c.BM25Score,
 			DenseScore: c.DenseScore,
 		})
+		id64, _ := strconv.ParseInt(c.ChunkID, 10, 64)
+		contextHits = append(contextHits, retrieval.HybridDocHit{
+			ID:         id64,
+			RelPath:    c.RelPath,
+			Text:       c.text,
+			Score:      c.Score,
+			BM25Score:  c.BM25Score,
+			DenseScore: c.DenseScore,
+		})
 	}
-	contextText := retrieval.BuildContextFromHybridHits(hh, 8000)
+	contextText := retrieval.BuildContextFromHybridHits(contextHits, 8000)
 	return SearchResponse{Hits: hits}, contextText, true
 }
 
-func (s *Services) buildRAGMaterials(ctx context.Context, tenantID, query string, queryVariants []string, topK int) (SearchResponse, string) {
-	// buildRAGMaterials 聚合检索材料：优先查租户已导入 chunks；未命中时再用 TS retrieve.ts；最后回退占位命中。
+func (s *Services) buildRAGMaterials(ctx context.Context, tenantID, rootDir, query string, queryVariants []string, topK int) (SearchResponse, string) {
+	// buildRAGMaterials 聚合检索材料：
+	// 1) 传了 root_dir 时优先扫本地目录（Codex 风格）
+	// 2) 再查租户已导入 chunks
+	// 3) 再走默认 TS target root
+	// 4) 最后回退占位命中
 	// 返回值：
 	// 1) SearchResponse：给 /search API 或 chat 调试信息用（结构化 hits）
 	// 2) string       ：给 /chat prompt / tool 直接使用的打包 context 文本
@@ -155,38 +332,38 @@ func (s *Services) buildRAGMaterials(ctx context.Context, tenantID, query string
 		// 调用方没传 topK 时给一个默认值，避免 TS/占位检索收到 0
 		topK = 8
 	}
+
+	// queryVariants 去重清洗：避免把原 query 重复传给 TS retrieve.ts。
+	tsVariants := make([]string, 0, len(queryVariants))
+	seen := map[string]struct{}{strings.TrimSpace(query): {}}
+	for _, q := range queryVariants {
+		q = strings.TrimSpace(q)
+		if q == "" {
+			continue
+		}
+		if _, ok := seen[q]; ok {
+			continue
+		}
+		seen[q] = struct{}{}
+		tsVariants = append(tsVariants, q)
+	}
+
+	rootDir = strings.TrimSpace(rootDir)
 	// 优先使用租户已导入的数据（MySQL chunks）。这是 API SaaS 主流程的真实检索来源。
 	if resp, ctxText, ok := s.searchTenantChunks(ctx, tenantID, query, queryVariants, topK); ok {
 		return resp, ctxText
 	}
-	if s.TSBridge != nil && s.TSBridge.Enabled() {
-		// 传给 TS retrieve.ts 时，queryVariants 不需要重复包含原 query。
-		// 原因：TS 的 collectQueries() 会把 query 和 queryVariants 合并，如果这里不去重会重复计算。
-		tsVariants := make([]string, 0, len(queryVariants))
-		// seen 是“去重集合”：
-		// key = 一个 query 字符串
-		// value 用空 struct{} 表示“出现过”，因为它占内存最小。
-		seen := map[string]struct{}{strings.TrimSpace(query): struct{}{}}
-		for _, q := range queryVariants {
-			// 逐个清洗 query 变体（去首尾空格）
-			q = strings.TrimSpace(q)
-			if q == "" {
-				// 空字符串无意义，跳过
-				continue
-			}
-			if _, ok := seen[q]; ok {
-				// 去重
-				// 已经出现过（包括原 query）就不再重复加入
-				continue
-			}
-			seen[q] = struct{}{}
-			// tsVariants 才是最终传给 TS retrieve.ts 的“额外 query 列表”
-			tsVariants = append(tsVariants, q)
+	if rootDir != "" && s.TSBridge != nil && s.TSBridge.Enabled() {
+		// tenant 中没有已索引数据时，再按 root_dir 扫本地代码。
+		if rag, err := s.TSBridge.BuildRAGWithRoot(ctx, rootDir, query, tsVariants, topK); err == nil {
+			return SearchResponse{Hits: mapTSHitsToSearchHits(rag.Hits, topK)}, rag.Context
 		}
-
+		// root_dir 扫描失败不直接报错，继续降级到默认根目录或占位结果。
+	}
+	if s.TSBridge != nil && s.TSBridge.Enabled() {
 		// 真正调用 TS RAG（Node 子进程 -> agent/dist/retrieve.js）。
 		// 成功：拿到 hits + context，转换后直接返回。
-		if rag, err := s.TSBridge.BuildRAG(ctx, query, tsVariants, topK); err == nil {
+		if rag, err := s.TSBridge.BuildRAGWithRoot(ctx, "", query, tsVariants, topK); err == nil {
 			return SearchResponse{Hits: mapTSHitsToSearchHits(rag.Hits, topK)}, rag.Context
 		}
 		// 失败时静默降级到占位结果；这样不会因为本地 Node/TS 目录问题影响 API 可用性
@@ -196,10 +373,10 @@ func (s *Services) buildRAGMaterials(ctx context.Context, tenantID, query string
 	return SearchResponse{Hits: buildPlaceholderSearchHits(topK)}, ""
 }
 
-func buildChatTools() []modelgateway.ToolDefinition {
-	// buildChatTools 定义模型可调用的函数（当前只暴露本地代码检索工具）。
-	// 这里返回的是“给模型看的工具说明书”（schema），不是工具执行逻辑本身。
-	return []modelgateway.ToolDefinition{
+func buildChatTools(mode string) []modelgateway.ToolDefinition {
+	// buildChatTools 定义模型可调用的函数。
+	// chat 模式只开放检索；edit 模式额外开放读写文件工具。
+	tools := []modelgateway.ToolDefinition{
 		{
 			Type: "function",
 			Function: modelgateway.ToolFunction{
@@ -223,12 +400,65 @@ func buildChatTools() []modelgateway.ToolDefinition {
 							"type":        "integer",
 							"description": "Max number of hits to return (1-12).",
 						},
+						"root_dir": map[string]any{
+							"type":        "string",
+							"description": "Optional local project root directory for scanning code files.",
+						},
 					},
 					"required": []string{"query"},
 				},
 			},
 		},
 	}
+
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "edit" || mode == "code" || mode == "coding" {
+		tools = append(tools,
+			modelgateway.ToolDefinition{
+				Type: "function",
+				Function: modelgateway.ToolFunction{
+					Name:        "read_file",
+					Description: "Read one source file from the workspace before making edits.",
+					Parameters: map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"path": map[string]any{
+								"type":        "string",
+								"description": "Relative or absolute path to the file inside workspace root.",
+							},
+							"max_chars": map[string]any{
+								"type":        "integer",
+								"description": "Optional max characters to return.",
+							},
+						},
+						"required": []string{"path"},
+					},
+				},
+			},
+			modelgateway.ToolDefinition{
+				Type: "function",
+				Function: modelgateway.ToolFunction{
+					Name:        "write_file",
+					Description: "Write updated content to one existing source file inside workspace root.",
+					Parameters: map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"path": map[string]any{
+								"type":        "string",
+								"description": "Relative or absolute path to the file inside workspace root.",
+							},
+							"content": map[string]any{
+								"type":        "string",
+								"description": "Full replacement file content.",
+							},
+						},
+						"required": []string{"path", "content"},
+					},
+				},
+			},
+		)
+	}
+	return tools
 }
 
 func (s *Services) runSearchCodebaseTool(ctx context.Context, req ChatRequest, rewritten []string, tc modelgateway.ToolCall) (toolContent string, evidence []string, hitCount int) {
@@ -266,7 +496,11 @@ func (s *Services) runSearchCodebaseTool(ctx context.Context, req ChatRequest, r
 	mergedVariants = append(mergedVariants, rewritten...)
 	mergedVariants = append(mergedVariants, args.QueryVariants...)
 
-	searchResp, ragContext := s.buildRAGMaterials(ctx, req.TenantID, query, mergedVariants, topK)
+	rootDir := strings.TrimSpace(args.RootDir)
+	if rootDir == "" {
+		rootDir = strings.TrimSpace(req.RootDir)
+	}
+	searchResp, ragContext := s.buildRAGMaterials(ctx, req.TenantID, rootDir, query, mergedVariants, topK)
 	files := make([]string, 0, len(searchResp.Hits))
 	compactHits := make([]map[string]any, 0, len(searchResp.Hits))
 	for _, h := range searchResp.Hits {
@@ -297,7 +531,420 @@ func (s *Services) runSearchCodebaseTool(ctx context.Context, req ChatRequest, r
 	return string(b), files, len(searchResp.Hits)
 }
 
-func (s *Services) chatWithFunctionCalling(ctx context.Context, req ChatRequest, rewritten []string) (answer string, evidence []string, hitCount int, err error) {
+func (s *Services) resolveWorkspaceRoot(rootDir string) string {
+	rootDir = strings.TrimSpace(rootDir)
+	if rootDir != "" {
+		if _, err := os.Stat(rootDir); err == nil {
+			return rootDir
+		}
+	}
+	if s.TSBridge != nil {
+		if fallback := strings.TrimSpace(s.TSBridge.DefaultRootDir()); fallback != "" {
+			if _, err := os.Stat(fallback); err == nil {
+				return fallback
+			}
+		}
+	}
+	if wd, err := os.Getwd(); err == nil {
+		return wd
+	}
+	return "."
+}
+
+func safeWorkspacePath(rootDir, inputPath string) (string, string, error) {
+	rootAbs, err := filepath.Abs(rootDir)
+	if err != nil {
+		return "", "", err
+	}
+	target := strings.TrimSpace(inputPath)
+	if target == "" {
+		return "", "", fmt.Errorf("empty path")
+	}
+	if !filepath.IsAbs(target) {
+		target = filepath.Join(rootAbs, target)
+	}
+	targetAbs, err := filepath.Abs(target)
+	if err != nil {
+		return "", "", err
+	}
+	rel, err := filepath.Rel(rootAbs, targetAbs)
+	if err != nil {
+		return "", "", err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", "", fmt.Errorf("path escapes workspace root")
+	}
+	return targetAbs, filepath.ToSlash(rel), nil
+}
+
+func (s *Services) runReadFileTool(req ChatRequest, tc modelgateway.ToolCall) string {
+	args := readFileToolArgs{}
+	if strings.TrimSpace(tc.Function.Arguments) != "" {
+		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+			b, _ := json.Marshal(map[string]any{"ok": false, "error": "invalid_tool_arguments", "detail": err.Error()})
+			return string(b)
+		}
+	}
+	root := s.resolveWorkspaceRoot(req.RootDir)
+	absPath, relPath, err := safeWorkspacePath(root, args.Path)
+	if err != nil {
+		b, _ := json.Marshal(map[string]any{"ok": false, "error": err.Error()})
+		return string(b)
+	}
+	body, err := os.ReadFile(absPath)
+	if err != nil {
+		b, _ := json.Marshal(map[string]any{"ok": false, "error": err.Error(), "path": relPath})
+		return string(b)
+	}
+	text := string(body)
+	maxChars := args.MaxChars
+	if maxChars <= 0 {
+		maxChars = 24000
+	}
+	if len(text) > maxChars {
+		text = text[:maxChars]
+	}
+	b, _ := json.Marshal(map[string]any{
+		"ok":      true,
+		"path":    relPath,
+		"content": text,
+	})
+	return string(b)
+}
+
+func (s *Services) runWriteFileTool(req ChatRequest, tc modelgateway.ToolCall) (string, string) {
+	args := writeFileToolArgs{}
+	if strings.TrimSpace(tc.Function.Arguments) != "" {
+		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+			b, _ := json.Marshal(map[string]any{"ok": false, "error": "invalid_tool_arguments", "detail": err.Error()})
+			return string(b), ""
+		}
+	}
+	root := s.resolveWorkspaceRoot(req.RootDir)
+	absPath, relPath, err := safeWorkspacePath(root, args.Path)
+	if err != nil {
+		b, _ := json.Marshal(map[string]any{"ok": false, "error": err.Error()})
+		return string(b), ""
+	}
+	if _, statErr := os.Stat(absPath); statErr != nil {
+		b, _ := json.Marshal(map[string]any{"ok": false, "error": "target file does not exist", "path": relPath})
+		return string(b), ""
+	}
+	if len(args.Content) > 600000 {
+		b, _ := json.Marshal(map[string]any{"ok": false, "error": "content too large", "path": relPath})
+		return string(b), ""
+	}
+	if writeErr := os.WriteFile(absPath, []byte(args.Content), 0644); writeErr != nil {
+		b, _ := json.Marshal(map[string]any{"ok": false, "error": writeErr.Error(), "path": relPath})
+		return string(b), ""
+	}
+	b, _ := json.Marshal(map[string]any{
+		"ok":    true,
+		"path":  relPath,
+		"bytes": len(args.Content),
+	})
+	return string(b), relPath
+}
+
+func (s *Services) loadSessionMemory(ctx context.Context, tenantID, sessionID string) []modelgateway.ChatMessage {
+	// loadSessionMemory 从 Redis 读取最近会话消息，按旧到新转成模型消息格式。
+	if s.Cache == nil || strings.TrimSpace(tenantID) == "" || strings.TrimSpace(sessionID) == "" {
+		return nil
+	}
+	items, err := s.Cache.LoadSessionMessages(ctx, tenantID, sessionID, s.MemoryMaxMessages)
+	if err != nil || len(items) == 0 {
+		return nil
+	}
+	out := make([]modelgateway.ChatMessage, 0, len(items))
+	for _, it := range items {
+		role := strings.TrimSpace(strings.ToLower(it.Role))
+		if role != "user" && role != "assistant" && role != "system" {
+			continue
+		}
+		content := strings.TrimSpace(it.Content)
+		if content == "" {
+			continue
+		}
+		out = append(out, modelgateway.ChatMessage{
+			Role:    role,
+			Content: content,
+		})
+	}
+	return out
+}
+
+func (s *Services) appendSessionMemory(ctx context.Context, tenantID, sessionID, role, content string) {
+	// appendSessionMemory 把 user/assistant 消息写入 Redis 会话记忆（失败不影响主流程）。
+	if s.Cache == nil || strings.TrimSpace(tenantID) == "" || strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	role = strings.TrimSpace(strings.ToLower(role))
+	if role != "user" && role != "assistant" && role != "system" {
+		return
+	}
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return
+	}
+	_ = s.Cache.AppendSessionMessage(ctx, tenantID, sessionID, redis.SessionMessage{
+		Role:    role,
+		Content: content,
+		At:      time.Now().Unix(),
+	}, s.MemoryMaxMessages, s.MemoryTTL)
+}
+
+type historyCompressionStats struct {
+	ModelContextTokens int
+	HistoryBefore      int
+	HistoryAfter       int
+	HistoryBudget      int
+	Compressed         bool
+}
+
+func estimateTextTokens(s string) int {
+	// estimateTextTokens 是近似估算：ASCII 约 4 字符/1 token，非 ASCII 按 1 字符/1 token 估算。
+	// 这里只用于上下文预算，不追求 tokenizer 级别精确。
+	if strings.TrimSpace(s) == "" {
+		return 0
+	}
+	ascii := 0
+	nonASCII := 0
+	for _, r := range s {
+		if r <= 127 {
+			ascii++
+		} else {
+			nonASCII++
+		}
+	}
+	return (ascii+3)/4 + nonASCII + 1
+}
+
+func estimateMessageTokens(m modelgateway.ChatMessage) int {
+	// 每条消息额外加协议开销，避免预算过于乐观。
+	return 6 + estimateTextTokens(m.Role) + estimateTextTokens(m.Name) + estimateTextTokens(m.Content)
+}
+
+func estimateMessagesTokens(messages []modelgateway.ChatMessage) int {
+	total := 0
+	for _, m := range messages {
+		total += estimateMessageTokens(m)
+	}
+	return total
+}
+
+func trimByApproxTokens(s string, maxTokens int) string {
+	if maxTokens <= 0 || strings.TrimSpace(s) == "" {
+		return ""
+	}
+	if estimateTextTokens(s) <= maxTokens {
+		return strings.TrimSpace(s)
+	}
+	// 反向按 rune 截断，直到落到目标 token 以下。
+	runes := []rune(s)
+	lo, hi := 0, len(runes)
+	best := ""
+	for lo <= hi {
+		mid := (lo + hi) / 2
+		cur := strings.TrimSpace(string(runes[:mid]))
+		if estimateTextTokens(cur) <= maxTokens {
+			best = cur
+			lo = mid + 1
+		} else {
+			hi = mid - 1
+		}
+	}
+	return best
+}
+
+func serializeHistoryForSummary(history []modelgateway.ChatMessage, maxBytes int) string {
+	if len(history) == 0 {
+		return ""
+	}
+	if maxBytes <= 0 {
+		maxBytes = 12000
+	}
+	var b strings.Builder
+	for i, m := range history {
+		role := strings.TrimSpace(strings.ToLower(m.Role))
+		if role == "" {
+			role = "unknown"
+		}
+		content := strings.TrimSpace(m.Content)
+		if content == "" {
+			continue
+		}
+		line := fmt.Sprintf("%d) %s: %s\n", i+1, role, content)
+		// 控制输入摘要模型的大小，避免二次请求又超窗。
+		if b.Len()+len(line) > maxBytes {
+			break
+		}
+		b.WriteString(line)
+	}
+	return b.String()
+}
+
+func (s *Services) summarizeHistoryForContext(ctx context.Context, mode string, history []modelgateway.ChatMessage, targetTokens int) string {
+	// summarizeHistoryForContext 用 LLM 压缩旧对话，只保留后续回答必须记住的信息。
+	if s.Model == nil || len(history) == 0 {
+		return ""
+	}
+	if targetTokens <= 0 {
+		targetTokens = s.SummaryTargetTokens
+	}
+	historyText := serializeHistoryForSummary(history, 12000)
+	if strings.TrimSpace(historyText) == "" {
+		return ""
+	}
+
+	systemPrompt := "You compress conversation memory for a coding assistant. Keep only high-value facts."
+	userPrompt := fmt.Sprintf(
+		"请把下面历史对话压缩成后续回答可用的上下文记忆。\n"+
+			"要求：\n"+
+			"1) 保留：用户目标、关键约束、已做决定、未完成事项、重要术语映射。\n"+
+			"2) 删除：寒暄、重复内容、低价值细节。\n"+
+			"3) 输出中文，使用 4-8 条要点。\n"+
+			"4) 目标长度不超过约 %d tokens。\n"+
+			"5) 当前模式：%s。\n\n历史对话：\n%s",
+		targetTokens,
+		strings.TrimSpace(mode),
+		historyText,
+	)
+
+	summaryCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	out, err := s.Model.Chat(summaryCtx, []modelgateway.ChatMessage{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: userPrompt},
+	}, 0.1)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(out)
+}
+
+func reverseMessages(in []modelgateway.ChatMessage) []modelgateway.ChatMessage {
+	out := make([]modelgateway.ChatMessage, 0, len(in))
+	for i := len(in) - 1; i >= 0; i-- {
+		out = append(out, in[i])
+	}
+	return out
+}
+
+func (s *Services) compressHistoryByContextWindow(ctx context.Context, req ChatRequest, history []modelgateway.ChatMessage, ragContext string) ([]modelgateway.ChatMessage, historyCompressionStats) {
+	// compressHistoryByContextWindow 按模型上下文上限动态裁剪历史：
+	// 1) 估算本轮总预算
+	// 2) 超预算时优先保留最近消息
+	// 3) 被裁掉的旧消息交给 LLM 摘要，再以 system memory 形式回灌
+	stats := historyCompressionStats{}
+	if len(history) == 0 {
+		return history, stats
+	}
+
+	maxCtx := 8192
+	if s.Model != nil {
+		maxCtx = s.Model.GetMaxContextTokens(ctx)
+	}
+	if maxCtx <= 0 {
+		maxCtx = 8192
+	}
+	stats.ModelContextTokens = maxCtx
+
+	// 估算本轮中“非历史”的 token 开销（system prompt + 当前 query + 预取 RAG 上下文 + 输出预留）。
+	systemOverhead := estimateTextTokens("You are a coding agent for local repositories.")
+	queryOverhead := estimateTextTokens(req.Message) + 40
+	ragOverhead := estimateTextTokens(ragContext)
+	if ragOverhead > maxCtx/3 {
+		// RAG context 仅作为预算参考，避免极端情况下历史预算被压成 0。
+		ragOverhead = maxCtx / 3
+	}
+	reserveForAnswer := maxCtx / 6
+	if reserveForAnswer < 512 {
+		reserveForAnswer = 512
+	}
+
+	budgetRatio := s.ContextBudgetRatio
+	if budgetRatio <= 0 {
+		budgetRatio = 0.78
+	}
+	totalPromptBudget := int(float64(maxCtx) * budgetRatio)
+	historyBudget := totalPromptBudget - systemOverhead - queryOverhead - ragOverhead - reserveForAnswer
+	if historyBudget < s.MinHistoryTokens {
+		historyBudget = s.MinHistoryTokens
+	}
+	if historyBudget < 128 {
+		historyBudget = 128
+	}
+	stats.HistoryBudget = historyBudget
+
+	beforeTokens := estimateMessagesTokens(history)
+	stats.HistoryBefore = beforeTokens
+	if beforeTokens <= historyBudget {
+		stats.HistoryAfter = beforeTokens
+		return history, stats
+	}
+
+	// 第一阶段：只保留最近消息（短期上下文优先）。
+	recentBudget := int(float64(historyBudget) * 0.65)
+	if recentBudget < 128 {
+		recentBudget = historyBudget
+	}
+	recent := make([]modelgateway.ChatMessage, 0, len(history))
+	used := 0
+	for i := len(history) - 1; i >= 0; i-- {
+		cost := estimateMessageTokens(history[i])
+		if used+cost > recentBudget && len(recent) >= 2 {
+			break
+		}
+		recent = append(recent, history[i])
+		used += cost
+	}
+	recent = reverseMessages(recent)
+	if len(recent) > len(history) {
+		recent = history
+	}
+	cutIdx := len(history) - len(recent)
+	if cutIdx < 0 {
+		cutIdx = 0
+	}
+	older := history[:cutIdx]
+
+	// 第二阶段：把 older 摘要后作为一条 system memory 回灌。
+	if len(older) > 0 {
+		target := s.SummaryTargetTokens
+		if target <= 0 {
+			target = 320
+		}
+		summary := s.summarizeHistoryForContext(ctx, req.Mode, older, target)
+		if summary != "" {
+			memory := "以下是自动压缩的会话历史摘要，请在回答时遵守：\n" + summary
+			combined := make([]modelgateway.ChatMessage, 0, len(recent)+1)
+			combined = append(combined, modelgateway.ChatMessage{Role: "system", Content: memory})
+			combined = append(combined, recent...)
+			combinedTokens := estimateMessagesTokens(combined)
+			if combinedTokens > historyBudget {
+				allowedSummary := historyBudget - estimateMessagesTokens(recent) - 8
+				memory = trimByApproxTokens(memory, allowedSummary)
+				if strings.TrimSpace(memory) != "" {
+					combined = append([]modelgateway.ChatMessage{{Role: "system", Content: memory}}, recent...)
+				} else {
+					combined = recent
+				}
+			}
+			after := estimateMessagesTokens(combined)
+			stats.HistoryAfter = after
+			stats.Compressed = after < beforeTokens
+			return combined, stats
+		}
+	}
+
+	// 摘要失败时只用 recent 兜底。
+	after := estimateMessagesTokens(recent)
+	stats.HistoryAfter = after
+	stats.Compressed = after < beforeTokens
+	return recent, stats
+}
+
+func (s *Services) chatWithFunctionCalling(ctx context.Context, req ChatRequest, rewritten []string, history []modelgateway.ChatMessage) (answer string, evidence []string, changedFiles []string, hitCount int, err error) {
 	// chatWithFunctionCalling 使用 OpenAI-compatible tools/tool_calls 完成“先检索再回答”的真实函数调用流程。
 	// 流程是：
 	// 1) 把 tools schema 发给模型
@@ -306,33 +953,37 @@ func (s *Services) chatWithFunctionCalling(ctx context.Context, req ChatRequest,
 	// 4) 把工具结果作为 role=tool 消息回给模型
 	// 5) 模型基于工具结果给最终答案
 	if s.Model == nil {
-		return "", nil, 0, fmt.Errorf("model client is nil")
+		return "", nil, nil, 0, fmt.Errorf("model client is nil")
 	}
 
-	tools := buildChatTools()
+	tools := buildChatTools(req.Mode)
+	systemPrompt := "You are a coding agent for local repositories. Use the search_codebase tool when the user asks about project/code details. After receiving tool results, answer in Chinese and cite relevant files."
+	mode := strings.ToLower(strings.TrimSpace(req.Mode))
+	if mode == "edit" || mode == "code" || mode == "coding" {
+		systemPrompt = "You are a coding agent for local repositories. In edit mode, inspect files first, then make minimal correct edits using read_file and write_file. Only write files inside the workspace root. After changes, answer in Chinese and summarize exactly which files changed."
+	}
 	messages := []modelgateway.ChatMessage{
 		{
-			Role: "system",
-			Content: "You are a coding agent for local repositories. " +
-				"Use the search_codebase tool when the user asks about project/code details. " +
-				"After receiving tool results, answer in Chinese and cite relevant files.",
-		},
-		{
-			Role:    "user",
-			Content: fmt.Sprintf("mode=%s\nuser_task=%s", strings.TrimSpace(req.Mode), strings.TrimSpace(req.Message)),
+			Role:    "system",
+			Content: systemPrompt,
 		},
 	}
+	messages = append(messages, history...)
+	messages = append(messages, modelgateway.ChatMessage{
+		Role:    "user",
+		Content: fmt.Sprintf("mode=%s\nuser_task=%s", strings.TrimSpace(req.Mode), strings.TrimSpace(req.Message)),
+	})
 
 	for round := 0; round < 3; round++ {
 		// 每一轮都让模型决定：继续调工具，还是直接给答案
 		out, callErr := s.Model.ChatCompletion(ctx, messages, 0.2, tools, "auto")
 		if callErr != nil {
-			return "", evidence, hitCount, callErr
+			return "", evidence, changedFiles, hitCount, callErr
 		}
 
 		if len(out.ToolCalls) == 0 {
 			// 没有 tool_calls 说明模型已经给出最终答案（或至少不再请求工具）
-			return strings.TrimSpace(out.Content), unique(evidence), hitCount, nil
+			return strings.TrimSpace(out.Content), unique(evidence), unique(changedFiles), hitCount, nil
 		}
 
 		// 把模型发出的 tool_calls 作为 assistant 消息回放回消息历史，符合 function-calling 协议。
@@ -352,6 +1003,14 @@ func (s *Services) chatWithFunctionCalling(ctx context.Context, req ChatRequest,
 				evidence = append(evidence, toolEvidence...)
 				if toolHits > hitCount {
 					hitCount = toolHits
+				}
+			case "read_file":
+				toolContent = s.runReadFileTool(req, tc)
+			case "write_file":
+				var changed string
+				toolContent, changed = s.runWriteFileTool(req, tc)
+				if changed != "" {
+					changedFiles = append(changedFiles, changed)
 				}
 			default:
 				b, _ := json.Marshal(map[string]any{
@@ -373,7 +1032,7 @@ func (s *Services) chatWithFunctionCalling(ctx context.Context, req ChatRequest,
 	}
 
 	// 兜底保护：防止模型无限循环调工具
-	return "", unique(evidence), hitCount, fmt.Errorf("tool_call_round_limit_exceeded")
+	return "", unique(evidence), unique(changedFiles), hitCount, fmt.Errorf("tool_call_round_limit_exceeded")
 }
 
 func (s *Services) Chat(ctx context.Context, req ChatRequest) (ChatResponse, error) {
@@ -389,12 +1048,15 @@ func (s *Services) Chat(ctx context.Context, req ChatRequest) (ChatResponse, err
 		"retrieval pipeline",
 		strings.ToLower(req.Mode),
 	})
+	// 读取最近会话历史（短期记忆），用于提升连续对话质量。
+	history := s.loadSessionMemory(ctx, req.TenantID, req.SessionID)
 
 	// 3) 获取检索材料：优先用 TS retrieve.ts（命中 + context），失败时回退占位结果
-	searchResp, ragContext := s.buildRAGMaterials(ctx, req.TenantID, req.Message, rewritten, 8)
+	searchResp, ragContext := s.buildRAGMaterials(ctx, req.TenantID, req.RootDir, req.Message, rewritten, 8)
 	// 这里的 searchResp/ragContext 是“预取”结果：
 	// - 给普通 fallback prompt 直接用
 	// - function-calling 成功时也能作为初始 evidence 参考/兜底
+	optimizedHistory, memoryStats := s.compressHistoryByContextWindow(ctx, req, history, ragContext)
 
 	// 4) 提取证据文件路径（供模型提示词和前端展示）
 	evidence := make([]string, 0, len(searchResp.Hits))
@@ -405,18 +1067,28 @@ func (s *Services) Chat(ctx context.Context, req ChatRequest) (ChatResponse, err
 	// 5) 调模型生成回答；模型不可用时使用兜底文案
 	answer := ""
 	candidateHits := len(searchResp.Hits)
+	modelErrors := make([]string, 0, 2)
+	changedFiles := make([]string, 0, 2)
+	effectiveRootDir := s.resolveWorkspaceRoot(req.RootDir)
 	if s.Model != nil {
 		// 优先走真正的 OpenAI-compatible function-calling（工具内部调用 TS RAG）。
-		if fcAnswer, fcEvidence, fcHits, fcErr := s.chatWithFunctionCalling(ctx, req, rewritten); fcErr == nil && strings.TrimSpace(fcAnswer) != "" {
+		if fcAnswer, fcEvidence, fcChangedFiles, fcHits, fcErr := s.chatWithFunctionCalling(ctx, req, rewritten, optimizedHistory); fcErr == nil && strings.TrimSpace(fcAnswer) != "" {
 			// function-calling 成功：用工具执行后返回的答案和 evidence 覆盖预取结果
 			answer = fcAnswer
 			if len(fcEvidence) > 0 {
 				evidence = unique(fcEvidence)
 			}
+			if len(fcChangedFiles) > 0 {
+				changedFiles = unique(fcChangedFiles)
+			}
 			if fcHits > 0 {
 				candidateHits = fcHits
 			}
 		} else {
+			if fcErr != nil {
+				modelErrors = append(modelErrors, "function-calling: "+fcErr.Error())
+				log.Printf("chat function-calling failed: session=%s tenant=%s err=%v", req.SessionID, req.TenantID, fcErr)
+			}
 			// provider 不支持 tools 或 function-calling 失败时，回退到普通 prompt + 检索上下文模式。
 			prompt := fmt.Sprintf(
 				"Task: %s\nEvidence files: %v\nRetrieved context:\n%s\nReturn concise Chinese answer in Chinese. If context is insufficient, say what is missing.",
@@ -424,15 +1096,32 @@ func (s *Services) Chat(ctx context.Context, req ChatRequest) (ChatResponse, err
 				evidence,
 				strings.TrimSpace(ragContext),
 			)
-			content, modelErr := s.Model.Chat(ctx, []modelgateway.ChatMessage{{Role: "user", Content: prompt}}, 0.2) // 调 LLM 生成回答
+			fallbackMessages := make([]modelgateway.ChatMessage, 0, len(history)+2)
+			fallbackMessages = append(fallbackMessages, modelgateway.ChatMessage{
+				Role:    "system",
+				Content: "You are a coding assistant. Answer in Chinese and cite relevant files from the provided context.",
+			})
+			fallbackMessages = append(fallbackMessages, optimizedHistory...)
+			fallbackMessages = append(fallbackMessages, modelgateway.ChatMessage{Role: "user", Content: prompt})
+			content, modelErr := s.Model.Chat(ctx, fallbackMessages, 0.2) // 调 LLM 生成回答
 			if modelErr == nil {
 				answer = content
+			} else {
+				modelErrors = append(modelErrors, "fallback-chat: "+modelErr.Error())
+				log.Printf("chat fallback failed: session=%s tenant=%s err=%v", req.SessionID, req.TenantID, modelErr)
 			}
 		}
 	}
 	if answer == "" {
-		answer = "当前为后端骨架实现：已完成检索、路由、任务队列接口。模型网关可用时会返回真实回答。"
+		if len(modelErrors) > 0 {
+			answer = "模型调用失败。请展开 retrieval debug 查看 model_error，或检查 docker logs agent_server_app。"
+		} else {
+			answer = "当前为后端骨架实现：已完成检索、路由、任务队列接口。模型网关可用时会返回真实回答。"
+		}
 	}
+	// 把本轮 user/assistant 写入会话短期记忆（失败不影响主流程）。
+	s.appendSessionMemory(ctx, req.TenantID, req.SessionID, "user", req.Message)
+	s.appendSessionMemory(ctx, req.TenantID, req.SessionID, "assistant", answer)
 
 	// 6) 记录检索日志（失败不影响主流程）
 	if s.Store != nil {
@@ -450,10 +1139,19 @@ func (s *Services) Chat(ctx context.Context, req ChatRequest) (ChatResponse, err
 	return ChatResponse{
 		Answer:        answer,
 		EvidenceFiles: unique(evidence),
+		ChangedFiles:  unique(changedFiles),
 		RetrievalDebug: RetrievalMeta{
-			Query:         req.Message,
-			Rewritten:     rewritten,
-			CandidateHits: candidateHits,
+			Query:               req.Message,
+			Rewritten:           rewritten,
+			CandidateHits:       candidateHits,
+			RootDir:             strings.TrimSpace(req.RootDir),
+			ModelContextTokens:  memoryStats.ModelContextTokens,
+			HistoryBeforeTokens: memoryStats.HistoryBefore,
+			HistoryAfterTokens:  memoryStats.HistoryAfter,
+			HistoryBudgetTokens: memoryStats.HistoryBudget,
+			HistoryCompressed:   memoryStats.Compressed,
+			ModelError:          strings.Join(modelErrors, " | "),
+			EffectiveRootDir:    effectiveRootDir,
 		},
 	}, nil
 }
@@ -521,15 +1219,18 @@ func (s *Services) Ingest(ctx context.Context, req IngestRequest) (IngestRespons
 func (s *Services) Search(ctx context.Context, req SearchRequest) (SearchResponse, error) {
 	// Search 执行检索流程：校验 -> 读缓存 -> 计算/生成结果 -> 写缓存 -> 返回。
 	// 1) 参数校验与默认值处理
-	if req.TenantID == "" || strings.TrimSpace(req.Query) == "" {
-		return SearchResponse{}, errors.New("tenant_id and query are required")
+	if strings.TrimSpace(req.Query) == "" {
+		return SearchResponse{}, errors.New("query is required")
+	}
+	if strings.TrimSpace(req.TenantID) == "" && strings.TrimSpace(req.RootDir) == "" {
+		return SearchResponse{}, errors.New("tenant_id or root_dir is required")
 	}
 	if req.TopK <= 0 {
 		req.TopK = 8
 	}
 
 	// 2) 检索缓存（按 tenant + topK + query）
-	cacheKey := fmt.Sprintf("search:%s:%d:%s", req.TenantID, req.TopK, strings.TrimSpace(req.Query))
+	cacheKey := fmt.Sprintf("search:%s:%d:%s:%s", strings.TrimSpace(req.TenantID), req.TopK, strings.TrimSpace(req.Query), hashShort(strings.TrimSpace(req.RootDir)))
 	if s.Cache != nil {
 		var cached SearchResponse
 		if ok, err := s.Cache.GetJSON(ctx, cacheKey, &cached); err == nil && ok { // 命中缓存则直接返回
@@ -538,7 +1239,7 @@ func (s *Services) Search(ctx context.Context, req SearchRequest) (SearchRespons
 	}
 
 	// 3) 实际检索：优先走 TS retrieve.ts（本地扫目录 + BM25 融合），失败时回退占位命中
-	resp, _ := s.buildRAGMaterials(ctx, req.TenantID, req.Query, nil, req.TopK)
+	resp, _ := s.buildRAGMaterials(ctx, req.TenantID, req.RootDir, req.Query, nil, req.TopK)
 	if s.Cache != nil {
 		// 写缓存失败不影响主流程
 		_ = s.Cache.SetJSON(ctx, cacheKey, resp, 2*time.Minute) // 写搜索缓存，TTL=2分钟
@@ -607,4 +1308,13 @@ func unique(in []string) []string {
 		out = append(out, v)
 	}
 	return out
+}
+
+func hashShort(s string) string {
+	// hashShort 生成短哈希，用于把长路径压缩进缓存 key。
+	if s == "" {
+		return "-"
+	}
+	sum := sha1.Sum([]byte(s))
+	return hex.EncodeToString(sum[:6])
 }

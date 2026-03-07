@@ -128,6 +128,30 @@ func (s *Store) ListChunksByTenant(ctx context.Context, tenantID string, limit i
 	return out, rows.Err()
 }
 
+func (s *Store) ListChunksByDocument(ctx context.Context, tenantID string, documentID int64) ([]ChunkRecord, error) {
+	// ListChunksByDocument 返回某文档下的全部 chunks，供 ingest 后写入向量库使用。
+	rows, err := s.DB.QueryContext(ctx, `
+		SELECT id, tenant_id, document_id, rel_path, chunk_index, text, token_count, created_at
+		FROM chunks
+		WHERE tenant_id = ? AND document_id = ?
+		ORDER BY chunk_index ASC, id ASC
+	`, tenantID, documentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make([]ChunkRecord, 0, 16)
+	for rows.Next() {
+		var c ChunkRecord
+		if err := rows.Scan(&c.ID, &c.TenantID, &c.DocumentID, &c.RelPath, &c.ChunkIndex, &c.Text, &c.TokenCount, &c.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) CreateTask(ctx context.Context, task TaskRecord) error {
 	// CreateTask 在 tasks 表插入一条新任务记录。
 	// 创建任务记录（ingest 等异步流程的起点）

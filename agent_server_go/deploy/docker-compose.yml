@@ -1,15 +1,20 @@
 services:
   app:
-    image: golang:1.22
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.app
+    image: agent_server_go_app:dev
     container_name: agent_server_app
     working_dir: /workspace
     volumes:
       - ..:/workspace
-    command: sh -c "go mod tidy && go run ./cmd/api"
+      - ../../agent:/workspace_agent:ro
+    command: sh -c "go run ./cmd/api"
     environment:
       APP_PORT: "8080"
       APP_ENV: "dev"
       APP_NAME: "agent-server-go"
+      GOPROXY: "https://goproxy.cn,direct"
       MYSQL_DSN: "root:root@tcp(mysql:3306)/agent?parseTime=true&charset=utf8mb4,utf8"
       REDIS_ADDR: "redis:6379"
       REDIS_PASSWORD: ""
@@ -18,9 +23,14 @@ services:
       JWT_SECRET: "change_me"
       RATE_LIMIT_RPS: "5"
       RATE_LIMIT_BURST: "10"
+      CHAT_MEMORY_MAX_MESSAGES: "12"
+      CHAT_MEMORY_TTL_SECONDS: "1800"
+      TS_RAG_AGENT_DIST_DIR: "/workspace_agent/dist"
+      TS_RAG_TARGET_ROOT_DIR: "/workspace"
       LLM_BASE_URL: "https://dashscope.aliyuncs.com/compatible-mode/v1"
-      LLM_API_KEY: ""
+      LLM_API_KEY: "${LLM_API_KEY:-}"
       LLM_MODEL: "qwen3-coder-plus"
+      LLM_MAX_CONTEXT_TOKENS: "0"
     ports:
       - "8080:8080"
     depends_on:

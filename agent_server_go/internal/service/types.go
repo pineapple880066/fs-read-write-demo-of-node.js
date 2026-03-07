@@ -7,12 +7,14 @@ type ChatRequest struct {
 	UserID    string `json:"user_id"`
 	Message   string `json:"message"`
 	Mode      string `json:"mode"`
+	RootDir   string `json:"root_dir,omitempty"`
 }
 
 // ChatResponse 对应 POST /v1/chat 的出参
 type ChatResponse struct {
 	Answer         string        `json:"answer"`
 	EvidenceFiles  []string      `json:"evidence_files"`
+	ChangedFiles   []string      `json:"changed_files,omitempty"`
 	RetrievalDebug RetrievalMeta `json:"retrieval_debug"`
 	TaskID         string        `json:"task_id,omitempty"`
 }
@@ -36,6 +38,7 @@ type SearchRequest struct {
 	TenantID string `json:"tenant_id"`
 	Query    string `json:"query"`
 	TopK     int    `json:"top_k"`
+	RootDir  string `json:"root_dir,omitempty"`
 }
 
 // SearchHit 是检索结果中的单条命中（chunk 级别）
@@ -63,7 +66,15 @@ type TaskResponse struct {
 
 // RetrievalMeta 用于 /chat 返回调试信息，便于观察检索行为
 type RetrievalMeta struct {
-	Query         string   `json:"query"`
-	Rewritten     []string `json:"rewritten_queries"`
-	CandidateHits int      `json:"candidate_hits"`
+	Query               string   `json:"query"`
+	Rewritten           []string `json:"rewritten_queries"`
+	CandidateHits       int      `json:"candidate_hits"`
+	RootDir             string   `json:"root_dir,omitempty"`
+	ModelContextTokens  int      `json:"model_context_tokens,omitempty"`
+	HistoryBeforeTokens int      `json:"history_before_tokens,omitempty"`
+	HistoryAfterTokens  int      `json:"history_after_tokens,omitempty"`
+	HistoryBudgetTokens int      `json:"history_budget_tokens,omitempty"`
+	HistoryCompressed   bool     `json:"history_compressed,omitempty"`
+	ModelError          string   `json:"model_error,omitempty"`
+	EffectiveRootDir    string   `json:"effective_root_dir,omitempty"`
 }

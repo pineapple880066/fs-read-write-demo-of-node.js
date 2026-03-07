@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Local Codebase Agent</title>
+  <link rel="stylesheet" href="/ui/app.css" />
+</head>
+<body>
+  <div class="shell">
+    <aside class="rail">
+      <div class="traffic">
+        <span class="dot red"></span>
+        <span class="dot amber"></span>
+        <span class="dot green"></span>
+      </div>
+      <button class="rail-action active" id="new-thread-btn" title="新建任务">
+        <span class="rail-icon">+</span>
+        <span>New task</span>
+      </button>
+      <button class="rail-action" id="focus-input-btn" title="聚焦输入框">
+        <span class="rail-icon">/</span>
+        <span>Ask</span>
+      </button>
+      <div class="rail-footer">
+        <div class="status-chip" id="boot-status">booting</div>
+      </div>
+    </aside>
+
+    <section class="threads-pane">
+      <div class="pane-header">
+        <div>
+          <p class="eyebrow">Threads</p>
+          <h1>Local agent</h1>
+        </div>
+        <button class="ghost-btn" id="threads-refresh-btn" title="刷新列表">refresh</button>
+      </div>
+
+      <div class="thread-toolbar">
+        <label class="field compact">
+          <span>Directory</span>
+          <input id="global-root-input" type="text" placeholder="/Users/pineapple/Desktop/javascript/agent_server_go" />
+        </label>
+      </div>
+
+      <div class="thread-list" id="thread-list"></div>
+    </section>
+
+    <main class="main-pane">
+      <header class="topbar">
+        <div class="topbar-left">
+          <p class="eyebrow">Task</p>
+          <h2 id="thread-title">New task</h2>
+          <p class="muted" id="thread-subtitle">本地代码问答，仅检索与回答，不修改文件</p>
+        </div>
+        <div class="topbar-right">
+          <div class="pill" id="model-pill">Model</div>
+          <div class="pill" id="session-pill">Session</div>
+        </div>
+      </header>
+
+      <section class="workspace-strip">
+        <label class="field wide">
+          <span>Workspace root</span>
+          <input id="thread-root-input" type="text" placeholder="/workspace or /Users/..." />
+        </label>
+        <button class="secondary-btn" id="apply-root-btn">Apply</button>
+      </section>
+
+      <section class="chat-scroll" id="chat-scroll">
+        <div class="welcome-card" id="welcome-card">
+          <p class="eyebrow">Codebase Q&A</p>
+          <h3>选中目录后直接提问</h3>
+          <p>当前版本会把 `root_dir` 传给 Go 后端，后端再走本地检索、上下文压缩和 LLM 回答。</p>
+          <div class="suggestions">
+            <button class="suggestion" data-question="解释 worker 消费 tasks 的流程">解释 worker 消费 tasks 的流程</button>
+            <button class="suggestion" data-question="这个项目现在支持哪些能力">这个项目现在支持哪些能力</button>
+            <button class="suggestion" data-question="有哪些 Redis 相关能力已经接入">有哪些 Redis 相关能力已经接入</button>
+          </div>
+        </div>
+        <div id="messages"></div>
+      </section>
+
+      <footer class="composer-wrap">
+        <div class="composer">
+          <textarea id="composer-input" rows="1" placeholder="输入代码问题，例如：解释这个目录的索引构建流程"></textarea>
+          <div class="composer-actions">
+            <div class="composer-meta">
+              <div class="mode-switch">
+                <button class="mode-chip active" data-mode="chat" type="button">chat</button>
+                <button class="mode-chip" data-mode="edit" type="button">edit</button>
+              </div>
+              <span id="composer-root-hint">root_dir required</span>
+            </div>
+            <button class="primary-btn" id="send-btn">Ask</button>
+          </div>
+        </div>
+      </footer>
+    </main>
+  </div>
+
+  <template id="message-template">
+    <article class="message">
+      <div class="avatar"></div>
+      <div class="bubble">
+        <div class="message-meta">
+          <span class="role"></span>
+          <span class="time"></span>
+        </div>
+        <div class="content"></div>
+        <div class="evidence"></div>
+        <details class="debug">
+          <summary>retrieval debug</summary>
+          <pre></pre>
+        </details>
+      </div>
+    </article>
+  </template>
+
+  <script src="/ui/app.js" defer></script>
+</body>
+</html>

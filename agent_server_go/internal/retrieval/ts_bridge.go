@@ -61,13 +61,33 @@ func (b *TSBridge) Enabled() bool {
 		strings.TrimSpace(b.cfg.TargetRootDir) != ""
 }
 
+// DefaultRootDir 返回桥接层配置的默认扫描根目录（通常是容器内的 /workspace）。
+func (b *TSBridge) DefaultRootDir() string {
+	if b == nil {
+		return ""
+	}
+	return strings.TrimSpace(b.cfg.TargetRootDir)
+}
+
 // BuildRAG 调用 Node 桥接脚本，直接复用 TS buildRagData（检索 + 上下文拼接）。
 func (b *TSBridge) BuildRAG(ctx context.Context, query string, queryVariants []string, topK int) (TSRAGResult, error) {
+	return b.BuildRAGWithRoot(ctx, b.cfg.TargetRootDir, query, queryVariants, topK)
+}
+
+// BuildRAGWithRoot 与 BuildRAG 相同，但允许调用方按请求动态覆盖 targetRootDir。
+func (b *TSBridge) BuildRAGWithRoot(ctx context.Context, targetRootDir string, query string, queryVariants []string, topK int) (TSRAGResult, error) {
 	if !b.Enabled() {
 		return TSRAGResult{}, fmt.Errorf("ts rag bridge not configured")
 	}
 	if strings.TrimSpace(query) == "" {
 		return TSRAGResult{}, fmt.Errorf("empty query")
+	}
+	targetRootDir = strings.TrimSpace(targetRootDir)
+	if targetRootDir == "" {
+		targetRootDir = b.cfg.TargetRootDir
+	}
+	if targetRootDir == "" {
+		return TSRAGResult{}, fmt.Errorf("empty target root dir")
 	}
 	if topK <= 0 {
 		topK = 8
@@ -75,7 +95,7 @@ func (b *TSBridge) BuildRAG(ctx context.Context, query string, queryVariants []s
 
 	in := map[string]any{
 		"agentDistDir":  b.cfg.AgentDistDir,
-		"targetRootDir": b.cfg.TargetRootDir,
+		"targetRootDir": targetRootDir,
 		"query":         query,
 		"queryVariants": queryVariants,
 		"topK":          topK,

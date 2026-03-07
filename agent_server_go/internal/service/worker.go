@@ -13,7 +13,9 @@ import (
 	"unicode/utf8"
 
 	"agent_server_go/internal/mq/rabbitmq"
+	"agent_server_go/internal/retrieval"
 	"agent_server_go/internal/store/mysql"
+	"agent_server_go/internal/vector/milvus"
 )
 
 // StartTaskConsumer 启动 MQ 消费者（当前是周5阶段的占位骨架）。
@@ -97,6 +99,26 @@ func (s *Services) handleIngestTask(ctx context.Context, msg rabbitmq.TaskMessag
 	if err := s.Store.ReplaceDocumentChunks(ctx, req.TenantID, docID, relPath, chunks); err != nil {
 		_ = s.Store.UpdateDocumentStatus(ctx, docID, "failed")
 		return fmt.Errorf("replace chunks failed: %w", err)
+	}
+
+	if s.Vector != nil && s.Vector.Enabled() {
+		inserted, listErr := s.Store.ListChunksByDocument(ctx, req.TenantID, docID)
+		if listErr != nil {
+			log.Printf("list chunks for milvus failed: tenant=%s doc=%d err=%v", req.TenantID, docID, listErr)
+		} else {
+			rows := make([]milvus.EmbeddingRow, 0, len(inserted))
+			for _, ch := range inserted {
+				rows = append(rows, milvus.EmbeddingRow{
+					ChunkID:   fmt.Sprintf("%d", ch.ID),
+					TenantID:  ch.TenantID,
+					RelPath:   ch.RelPath,
+					Embedding: retrieval.HashEmbedText(ch.Text),
+				})
+			}
+			if err := s.Vector.UpsertEmbeddings(ctx, rows); err != nil {
+				log.Printf("milvus upsert failed: tenant=%s doc=%d err=%v", req.TenantID, docID, err)
+			}
+		}
 	}
 	if err := s.Store.UpdateDocumentStatus(ctx, docID, "ready"); err != nil {
 		return fmt.Errorf("update document status failed: %w", err)

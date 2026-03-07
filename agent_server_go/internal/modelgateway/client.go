@@ -6,6 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -15,6 +19,12 @@ type Client struct {
 	APIKey  string
 	Model   string
 	HTTP    *http.Client
+	// MaxContextTokens 可通过配置覆盖；<=0 时会尝试探测并兜底估算。
+	MaxContextTokens int
+
+	mu                   sync.RWMutex
+	resolvedContextToken int
+	contextResolved      bool
 }
 
 type ChatMessage struct {
@@ -87,6 +97,235 @@ func New(baseURL, apiKey, model string) *Client {
 		APIKey:  apiKey,
 		Model:   model,
 		HTTP:    &http.Client{Timeout: 25 * time.Second},
+	}
+}
+
+// SetMaxContextTokens 允许通过配置显式指定模型上下文窗口大小。
+func (c *Client) SetMaxContextTokens(n int) {
+	if n <= 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.MaxContextTokens = n
+	c.resolvedContextToken = n
+	c.contextResolved = true
+}
+
+// GetMaxContextTokens 返回模型可用上下文窗口（token 级别）。
+// 优先级：
+// 1) 显式配置 MaxContextTokens
+// 2) 调用 OpenAI-compatible /models 接口探测
+// 3) 按模型名保守估算
+// 4) 最终兜底 8192
+func (c *Client) GetMaxContextTokens(ctx context.Context) int {
+	c.mu.RLock()
+	if c.contextResolved && c.resolvedContextToken > 0 {
+		n := c.resolvedContextToken
+		c.mu.RUnlock()
+		return n
+	}
+	override := c.MaxContextTokens
+	c.mu.RUnlock()
+
+	if override > 0 {
+		c.cacheContextTokens(override)
+		return override
+	}
+
+	if n, err := c.fetchContextTokens(ctx); err == nil && n > 0 {
+		c.cacheContextTokens(n)
+		return n
+	}
+
+	guess := guessContextTokensByModelName(c.Model)
+	if guess <= 0 {
+		guess = 8192
+	}
+	c.cacheContextTokens(guess)
+	return guess
+}
+
+func (c *Client) cacheContextTokens(n int) {
+	if n <= 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.resolvedContextToken = n
+	c.contextResolved = true
+}
+
+func (c *Client) fetchContextTokens(ctx context.Context) (int, error) {
+	if strings.TrimSpace(c.APIKey) == "" {
+		return 0, fmt.Errorf("missing api key")
+	}
+	if strings.TrimSpace(c.BaseURL) == "" {
+		return 0, fmt.Errorf("missing base url")
+	}
+
+	// 优先查单模型详情；部分 provider 会在该接口带能力元信息。
+	if strings.TrimSpace(c.Model) != "" {
+		u := strings.TrimRight(c.BaseURL, "/") + "/models/" + url.PathEscape(strings.TrimSpace(c.Model))
+		var detail map[string]any
+		if err := c.getJSON(ctx, u, &detail); err == nil {
+			if n := extractContextTokens(detail); n > 0 {
+				return n, nil
+			}
+		}
+	}
+
+	// 回退到模型列表扫描。
+	u := strings.TrimRight(c.BaseURL, "/") + "/models"
+	var list map[string]any
+	if err := c.getJSON(ctx, u, &list); err != nil {
+		return 0, err
+	}
+	if n := extractContextTokensFromModelList(list, c.Model); n > 0 {
+		return n, nil
+	}
+	if n := extractContextTokens(list); n > 0 {
+		return n, nil
+	}
+	return 0, fmt.Errorf("context token limit not found in /models response")
+}
+
+func (c *Client) getJSON(ctx context.Context, endpoint string, out any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode/100 != 2 {
+		return fmt.Errorf("http status %d", resp.StatusCode)
+	}
+	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+func extractContextTokens(v any) int {
+	preferredKeys := []string{
+		"context_window",
+		"max_context_tokens",
+		"context_length",
+		"max_input_tokens",
+		"input_token_limit",
+		"max_model_len",
+		"max_position_embeddings",
+	}
+	switch vv := v.(type) {
+	case map[string]any:
+		for _, want := range preferredKeys {
+			for k, child := range vv {
+				if strings.EqualFold(k, want) {
+					if n := toPositiveInt(child); n > 0 {
+						return n
+					}
+				}
+			}
+		}
+		for _, child := range vv {
+			if n := extractContextTokens(child); n > 0 {
+				return n
+			}
+		}
+	case []any:
+		for _, item := range vv {
+			if n := extractContextTokens(item); n > 0 {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
+func extractContextTokensFromModelList(list map[string]any, model string) int {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return 0
+	}
+	raw, ok := list["data"]
+	if !ok {
+		return 0
+	}
+	arr, ok := raw.([]any)
+	if !ok {
+		return 0
+	}
+	for _, item := range arr {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		id, _ := m["id"].(string)
+		if !strings.EqualFold(strings.TrimSpace(id), model) {
+			continue
+		}
+		if n := extractContextTokens(m); n > 0 {
+			return n
+		}
+	}
+	return 0
+}
+
+func toPositiveInt(v any) int {
+	switch n := v.(type) {
+	case int:
+		if n > 0 {
+			return n
+		}
+	case int32:
+		if n > 0 {
+			return int(n)
+		}
+	case int64:
+		if n > 0 {
+			return int(n)
+		}
+	case float64:
+		if n > 0 {
+			return int(n)
+		}
+	case json.Number:
+		if i, err := n.Int64(); err == nil && i > 0 {
+			return int(i)
+		}
+	case string:
+		s := strings.TrimSpace(n)
+		if s == "" {
+			return 0
+		}
+		if i, err := strconv.Atoi(s); err == nil && i > 0 {
+			return i
+		}
+	}
+	return 0
+}
+
+func guessContextTokensByModelName(model string) int {
+	m := strings.ToLower(strings.TrimSpace(model))
+	switch {
+	case m == "":
+		return 8192
+	case strings.Contains(m, "gpt-4o"), strings.Contains(m, "gpt-4.1"), strings.Contains(m, "o1"), strings.Contains(m, "o3"):
+		return 128000
+	case strings.Contains(m, "claude"):
+		return 200000
+	case strings.Contains(m, "qwen"):
+		return 32768
+	case strings.Contains(m, "deepseek"):
+		return 64000
+	case strings.Contains(m, "gemini"):
+		return 128000
+	default:
+		return 8192
 	}
 }
 

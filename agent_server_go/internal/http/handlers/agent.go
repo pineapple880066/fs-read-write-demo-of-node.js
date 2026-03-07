@@ -9,12 +9,13 @@ import (
 
 type AgentHandler struct {
 	// handler 只负责 HTTP 层协议转换，业务逻辑放在 service
-	Svc *service.Services
+	Svc       *service.Services
+	JWTSecret string
 }
 
-func NewAgentHandler(svc *service.Services) *AgentHandler {
+func NewAgentHandler(svc *service.Services, jwtSecret string) *AgentHandler {
 	// NewAgentHandler 创建 HTTP handler，并注入 service 层依赖。
-	return &AgentHandler{Svc: svc}
+	return &AgentHandler{Svc: svc, JWTSecret: jwtSecret}
 }
 
 func (h *AgentHandler) Chat(c *fiber.Ctx) error {

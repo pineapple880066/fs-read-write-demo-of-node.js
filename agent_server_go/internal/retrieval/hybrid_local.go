@@ -16,6 +16,8 @@ const (
 	denseVecDims = 256 // 本地“向量检索”简化版维度；后续可替换为真实 embedding + Milvus
 )
 
+const DenseVectorDims = denseVecDims
+
 var (
 	tokenSplitRe = regexp.MustCompile(`[^a-z0-9_\p{Han}]+`)
 	fullPathRe   = regexp.MustCompile(`[a-z0-9_./-]+\.[a-z0-9]+`)
@@ -200,6 +202,111 @@ func HybridSearchLocalDocs(docs []HybridDoc, query string, queryVariants []strin
 	return out
 }
 
+// BM25SearchLocalDocs 只保留 BM25 词法召回分支，供“BM25 + 外部 Milvus dense”融合使用。
+func BM25SearchLocalDocs(docs []HybridDoc, query string, queryVariants []string, topK int) []HybridDocHit {
+	if len(docs) == 0 {
+		return nil
+	}
+	if topK <= 0 {
+		topK = 8
+	}
+
+	idx := buildHybridIndex(docs)
+	queries := collectQueriesLocal(query, queryVariants)
+	if len(queries) == 0 {
+		return nil
+	}
+	hints := buildPathHintsLocal(queries)
+	merged := make(map[int64]*mergedHybridStats, len(idx.docs))
+
+	recallK := topK * 5
+	if recallK < 40 {
+		recallK = 40
+	}
+	if recallK > len(idx.docs) {
+		recallK = len(idx.docs)
+	}
+
+	for _, q := range queries {
+		bm25Scores, maxBM25 := scoreBM25All(idx, q)
+
+		type qcand struct {
+			id    int64
+			score float64
+		}
+		tmp := make([]qcand, 0, len(idx.docs))
+		for _, d := range idx.docs {
+			bm25Norm := Normalize(bm25Scores[d.ID], maxBM25)
+			if bm25Norm <= 0 {
+				continue
+			}
+			tmp = append(tmp, qcand{id: d.ID, score: bm25Norm})
+		}
+		sort.SliceStable(tmp, func(i, j int) bool { return tmp[i].score > tmp[j].score })
+		if len(tmp) > recallK {
+			tmp = tmp[:recallK]
+		}
+
+		hitSet := make(map[int64]struct{}, len(tmp))
+		for _, c := range tmp {
+			hitSet[c.id] = struct{}{}
+		}
+
+		for _, c := range tmp {
+			doc := idx.getDocByID(c.id)
+			if doc == nil {
+				continue
+			}
+			prev := merged[c.id]
+			if prev == nil {
+				prev = &mergedHybridStats{doc: *doc}
+				merged[c.id] = prev
+			}
+			bm25Raw := bm25Scores[c.id]
+			prev.rawBM25Max = math.Max(prev.rawBM25Max, bm25Raw)
+			prev.normBM25Max = math.Max(prev.normBM25Max, Normalize(bm25Raw, maxBM25))
+		}
+		for id := range hitSet {
+			if prev := merged[id]; prev != nil {
+				prev.queryHits++
+			}
+		}
+	}
+
+	if len(merged) == 0 {
+		return nil
+	}
+
+	totalQueries := float64(len(queries))
+	out := make([]HybridDocHit, 0, len(merged))
+	for _, m := range merged {
+		pathBoost := calcPathBoostLocal(m.doc.RelPath, hints)
+		queryCoverage := float64(m.queryHits) / totalQueries
+		score := 0.75*m.normBM25Max + 0.15*queryCoverage + 0.10*pathBoost
+		out = append(out, HybridDocHit{
+			ID:            m.doc.ID,
+			RelPath:       m.doc.RelPath,
+			Text:          m.doc.Text,
+			Score:         round4(score),
+			BM25Score:     round4(m.rawBM25Max),
+			DenseScore:    0,
+			QueryCoverage: round4(queryCoverage),
+			PathBoost:     round4(pathBoost),
+		})
+	}
+
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Score == out[j].Score {
+			return out[i].BM25Score > out[j].BM25Score
+		}
+		return out[i].Score > out[j].Score
+	})
+	if len(out) > topK {
+		out = out[:topK]
+	}
+	return out
+}
+
 // BuildContextFromHybridHits 把命中列表打包成 prompt 可用上下文。
 func BuildContextFromHybridHits(hits []HybridDocHit, maxChars int) string {
 	if maxChars <= 0 {
@@ -347,6 +454,18 @@ func vectorizeLocal(text string, tokens []string) []float64 {
 	}
 	l2Normalize(vec)
 	return vec
+}
+
+// HashEmbedText 返回与本地 dense 检索同源的确定性哈希向量。
+// 当前先把这组向量写入 Milvus，后续可平滑替换为真实 embedding provider。
+func HashEmbedText(text string) []float32 {
+	tokens := tokenizeLocal(text)
+	vec64 := vectorizeLocal(text, tokens)
+	out := make([]float32, len(vec64))
+	for i, v := range vec64 {
+		out[i] = float32(v)
+	}
+	return out
 }
 
 func normalizeForBigram(s string) string { return strings.ToLower(strings.TrimSpace(s)) }

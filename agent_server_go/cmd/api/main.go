@@ -17,6 +17,7 @@ import (
 	"agent_server_go/internal/retrieval"
 	"agent_server_go/internal/service"
 	"agent_server_go/internal/store/mysql"
+	"agent_server_go/internal/vector/milvus"
 )
 
 func main() {
@@ -76,7 +77,10 @@ func main() {
 
 	// 6) 初始化模型网关与 service 层（聚合业务依赖）
 	model := modelgateway.New(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)             // 创建 OpenAI-compatible 模型客户端
+	model.SetMaxContextTokens(cfg.LLMMaxContextTokens)                                 // 可选：环境变量显式覆盖上下文窗口
 	svc := service.New(store, redisClient, mq, model, cfg.RateLimitRPS, cfg.RateBurst) // 组装业务服务（service 层）
+	svc.SetMemoryOptions(cfg.ChatMemoryMaxMessages, cfg.ChatMemoryTTLSeconds)          // 配置会话短期记忆窗口与 TTL
+	svc.SetVectorClient(milvus.New(cfg.MilvusAddr))                                    // 接入真实 Milvus REST 客户端
 	// 可选：桥接到已有 TypeScript RAG（agent/dist/retrieve.js）；失败时 service 会自动回退占位检索。
 	svc.SetTSBridge(retrieval.NewTSBridge(retrieval.TSBridgeConfig{
 		NodeBin:       cfg.TSRAGNodeBin,

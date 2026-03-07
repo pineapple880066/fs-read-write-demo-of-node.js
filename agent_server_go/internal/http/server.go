@@ -41,9 +41,14 @@ func NewServer(svc *service.Services, redisClient *cache.Client, jwtSecret strin
 		return err
 	})
 
-	h := handlers.NewAgentHandler(svc) // 创建 HTTP handler（内部调用 service 层）
+	h := handlers.NewAgentHandler(svc, jwtSecret) // 创建 HTTP handler（内部调用 service 层）
+	web := handlers.NewWebHandler(jwtSecret)      // 前端 UI + bootstrap token
 
 	// 基础探针与 Prometheus 指标端点（不做鉴权，方便监控系统抓取）
+	app.Get("/", web.Index)                                                                                 // 本地 Codex 风格单页 UI
+	app.Get("/ui/bootstrap", web.Bootstrap)                                                                 // 给浏览器前端签一个本地演示 JWT
+	app.Get("/ui/app.css", web.AppCSS)                                                                      // UI 样式
+	app.Get("/ui/app.js", web.AppJS)                                                                        // UI 逻辑
 	app.Get("/healthz", handlers.Health)                                                                    // 健康检查端点
 	app.Get("/metrics", adaptor.HTTPHandler(promhttp.HandlerFor(metrics.Registry, promhttp.HandlerOpts{}))) // 显示 Prometheus 指标（标准 net/http handler 适配到 Fiber）
 
