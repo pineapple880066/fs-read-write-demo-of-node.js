@@ -25,6 +25,8 @@ type Config struct {
 	LLMBaseURL string
 	LLMAPIKey  string
 	LLMModel   string
+	// LLMHTTPTimeoutSeconds 控制单次模型 HTTP 请求超时；edit/tool-calling 场景通常需要更长时间。
+	LLMHTTPTimeoutSeconds int
 	// 可选：显式覆盖模型上下文窗口（token），<=0 时自动探测/估算
 	LLMMaxContextTokens int
 	// 安全与限流配置
@@ -51,8 +53,9 @@ func Load() Config {
 		RabbitMQURL:           getEnv("RABBITMQ_URL", "amqp://guest:guest@127.0.0.1:5672/"),
 		MilvusAddr:            getEnv("MILVUS_ADDR", "127.0.0.1:19530"),
 		LLMBaseURL:            getEnv("LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-		LLMAPIKey:             getEnv("LLM_API_KEY", ""),
+		LLMAPIKey:             getEnv("LLM_API_KEY", "sk-6cea20a3640349d6816279e0d0f0dbb1"),
 		LLMModel:              getEnv("LLM_MODEL", "qwen3-coder-plus"),
+		LLMHTTPTimeoutSeconds: getEnvInt("LLM_HTTP_TIMEOUT_SECONDS", 60),
 		LLMMaxContextTokens:   getEnvInt("LLM_MAX_CONTEXT_TOKENS", 0),
 		JWTSecret:             getEnv("JWT_SECRET", "change_me"),
 		RateLimitRPS:          getEnvInt("RATE_LIMIT_RPS", 5),

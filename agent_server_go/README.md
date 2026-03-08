@@ -127,6 +127,7 @@ Before sending to LLM, service will auto-fit history by model context window:
 Env knobs:
 - `CHAT_MEMORY_MAX_MESSAGES` (default: `12`)
 - `CHAT_MEMORY_TTL_SECONDS` (default: `1800`)
+- `LLM_HTTP_TIMEOUT_SECONDS` (default: `60`)
 - `LLM_MAX_CONTEXT_TOKENS` (default: `0`, means auto-detect/guess)
 
 ### Built-in browser UI
@@ -137,8 +138,9 @@ Current scope:
 - create local threads/tasks
 - set `root_dir`
 - ask codebase questions through `/v1/chat`
+- edit files through `/v1/chat` in `edit` mode
 - show evidence files and retrieval debug
 
 Current limits:
 - browser cannot open native folder picker with a real absolute path, so `root_dir` is currently typed manually
-- no code editing yet, only ask/search/answer
+- local AST parsing currently targets `.go` files; other languages still use text chunk retrieval

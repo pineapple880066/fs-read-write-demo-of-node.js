@@ -66,15 +66,20 @@ type TaskResponse struct {
 
 // RetrievalMeta 用于 /chat 返回调试信息，便于观察检索行为
 type RetrievalMeta struct {
-	Query               string   `json:"query"`
-	Rewritten           []string `json:"rewritten_queries"`
-	CandidateHits       int      `json:"candidate_hits"`
-	RootDir             string   `json:"root_dir,omitempty"`
-	ModelContextTokens  int      `json:"model_context_tokens,omitempty"`
-	HistoryBeforeTokens int      `json:"history_before_tokens,omitempty"`
-	HistoryAfterTokens  int      `json:"history_after_tokens,omitempty"`
-	HistoryBudgetTokens int      `json:"history_budget_tokens,omitempty"`
-	HistoryCompressed   bool     `json:"history_compressed,omitempty"`
-	ModelError          string   `json:"model_error,omitempty"`
-	EffectiveRootDir    string   `json:"effective_root_dir,omitempty"`
+	Query                string   `json:"query"`
+	Rewritten            []string `json:"rewritten_queries"`
+	CandidateHits        int      `json:"candidate_hits"`
+	RetrievalStrategy    string   `json:"retrieval_strategy,omitempty"`
+	TaskRoute            string   `json:"task_route,omitempty"`
+	TaskPlan             []string `json:"task_plan,omitempty"`
+	TargetFiles          []string `json:"target_files,omitempty"`
+	RootDir              string   `json:"root_dir,omitempty"`
+	ModelContextTokens   int      `json:"model_context_tokens,omitempty"`
+	HistoryBeforeTokens  int      `json:"history_before_tokens,omitempty"`
+	HistoryAfterTokens   int      `json:"history_after_tokens,omitempty"`
+	HistoryBudgetTokens  int      `json:"history_budget_tokens,omitempty"`
+	HistoryCompressed    bool     `json:"history_compressed,omitempty"`
+	ModelError           string   `json:"model_error,omitempty"`
+	EffectiveRootDir     string   `json:"effective_root_dir,omitempty"`
+	VerificationCommands []string `json:"verification_commands,omitempty"`
 }

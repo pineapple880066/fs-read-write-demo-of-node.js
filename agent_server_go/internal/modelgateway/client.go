@@ -96,8 +96,20 @@ func New(baseURL, apiKey, model string) *Client {
 		BaseURL: baseURL,
 		APIKey:  apiKey,
 		Model:   model,
-		HTTP:    &http.Client{Timeout: 25 * time.Second},
+		HTTP:    &http.Client{Timeout: 60 * time.Second},
 	}
+}
+
+// SetHTTPTimeout 允许外部按环境配置覆盖模型 HTTP 超时。
+func (c *Client) SetHTTPTimeout(timeout time.Duration) {
+	if timeout <= 0 {
+		return
+	}
+	if c.HTTP == nil {
+		c.HTTP = &http.Client{Timeout: timeout}
+		return
+	}
+	c.HTTP.Timeout = timeout
 }
 
 // SetMaxContextTokens 允许通过配置显式指定模型上下文窗口大小。

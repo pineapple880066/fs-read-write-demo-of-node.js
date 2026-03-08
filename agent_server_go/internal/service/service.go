@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -37,9 +38,21 @@ type readFileToolArgs struct {
 	MaxChars int    `json:"max_chars,omitempty"`
 }
 
+type readFileRangeToolArgs struct {
+	Path      string `json:"path"`
+	StartLine int    `json:"start_line"`
+	EndLine   int    `json:"end_line"`
+	MaxChars  int    `json:"max_chars,omitempty"`
+}
+
 type writeFileToolArgs struct {
 	Path    string `json:"path"`
 	Content string `json:"content"`
+}
+
+type runCommandToolArgs struct {
+	Command string `json:"command"`
+	Workdir string `json:"workdir,omitempty"`
 }
 
 type Services struct {
@@ -319,15 +332,17 @@ func (s *Services) searchTenantChunks(ctx context.Context, tenantID, query strin
 	return SearchResponse{Hits: hits}, contextText, true
 }
 
-func (s *Services) buildRAGMaterials(ctx context.Context, tenantID, rootDir, query string, queryVariants []string, topK int) (SearchResponse, string) {
+func (s *Services) buildRAGMaterials(ctx context.Context, tenantID, rootDir, query string, queryVariants []string, topK int) (SearchResponse, string, string) {
 	// buildRAGMaterials 聚合检索材料：
-	// 1) 传了 root_dir 时优先扫本地目录（Codex 风格）
-	// 2) 再查租户已导入 chunks
-	// 3) 再走默认 TS target root
-	// 4) 最后回退占位命中
+	// 1) 先查租户已导入 chunks（MySQL + Milvus）
+	// 2) 传了 root_dir 时，尝试 Go 本地 AST + chunk 检索
+	// 3) 再走 TS bridge 扫本地目录
+	// 4) 再走默认 TS target root
+	// 5) 最后回退占位命中
 	// 返回值：
 	// 1) SearchResponse：给 /search API 或 chat 调试信息用（结构化 hits）
 	// 2) string       ：给 /chat prompt / tool 直接使用的打包 context 文本
+	// 3) string       ：检索策略标记（tenant_hybrid/local_ast/ts_bridge_root/ts_bridge_default/placeholder）
 	if topK <= 0 {
 		// 调用方没传 topK 时给一个默认值，避免 TS/占位检索收到 0
 		topK = 8
@@ -351,12 +366,18 @@ func (s *Services) buildRAGMaterials(ctx context.Context, tenantID, rootDir, que
 	rootDir = strings.TrimSpace(rootDir)
 	// 优先使用租户已导入的数据（MySQL chunks）。这是 API SaaS 主流程的真实检索来源。
 	if resp, ctxText, ok := s.searchTenantChunks(ctx, tenantID, query, queryVariants, topK); ok {
-		return resp, ctxText
+		return resp, ctxText, "tenant_hybrid"
+	}
+	if rootDir != "" {
+		// 本地目录检索优先尝试 Go AST + chunk 混合检索，结构类问题通常比纯文本更稳。
+		if resp, ctxText, ok := s.searchLocalWorkspaceWithAST(rootDir, query, queryVariants, topK); ok {
+			return resp, ctxText, "local_ast"
+		}
 	}
 	if rootDir != "" && s.TSBridge != nil && s.TSBridge.Enabled() {
 		// tenant 中没有已索引数据时，再按 root_dir 扫本地代码。
 		if rag, err := s.TSBridge.BuildRAGWithRoot(ctx, rootDir, query, tsVariants, topK); err == nil {
-			return SearchResponse{Hits: mapTSHitsToSearchHits(rag.Hits, topK)}, rag.Context
+			return SearchResponse{Hits: mapTSHitsToSearchHits(rag.Hits, topK)}, rag.Context, "ts_bridge_root"
 		}
 		// root_dir 扫描失败不直接报错，继续降级到默认根目录或占位结果。
 	}
@@ -364,13 +385,13 @@ func (s *Services) buildRAGMaterials(ctx context.Context, tenantID, rootDir, que
 		// 真正调用 TS RAG（Node 子进程 -> agent/dist/retrieve.js）。
 		// 成功：拿到 hits + context，转换后直接返回。
 		if rag, err := s.TSBridge.BuildRAGWithRoot(ctx, "", query, tsVariants, topK); err == nil {
-			return SearchResponse{Hits: mapTSHitsToSearchHits(rag.Hits, topK)}, rag.Context
+			return SearchResponse{Hits: mapTSHitsToSearchHits(rag.Hits, topK)}, rag.Context, "ts_bridge_default"
 		}
 		// 失败时静默降级到占位结果；这样不会因为本地 Node/TS 目录问题影响 API 可用性
 	}
 
 	// 未命中租户数据、TS bridge 未配置或调用失败时，回退到占位命中（context 返回空字符串）
-	return SearchResponse{Hits: buildPlaceholderSearchHits(topK)}, ""
+	return SearchResponse{Hits: buildPlaceholderSearchHits(topK)}, "", "placeholder"
 }
 
 func buildChatTools(mode string) []modelgateway.ToolDefinition {
@@ -438,6 +459,35 @@ func buildChatTools(mode string) []modelgateway.ToolDefinition {
 			modelgateway.ToolDefinition{
 				Type: "function",
 				Function: modelgateway.ToolFunction{
+					Name:        "read_file_range",
+					Description: "Read a specific line range from one source file. Use this for large files or when the controller requires full-file inspection before edits.",
+					Parameters: map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"path": map[string]any{
+								"type":        "string",
+								"description": "Relative or absolute path to the file inside workspace root.",
+							},
+							"start_line": map[string]any{
+								"type":        "integer",
+								"description": "1-based inclusive start line.",
+							},
+							"end_line": map[string]any{
+								"type":        "integer",
+								"description": "1-based inclusive end line.",
+							},
+							"max_chars": map[string]any{
+								"type":        "integer",
+								"description": "Optional max characters to return.",
+							},
+						},
+						"required": []string{"path", "start_line", "end_line"},
+					},
+				},
+			},
+			modelgateway.ToolDefinition{
+				Type: "function",
+				Function: modelgateway.ToolFunction{
 					Name:        "write_file",
 					Description: "Write updated content to one existing source file inside workspace root.",
 					Parameters: map[string]any{
@@ -453,6 +503,27 @@ func buildChatTools(mode string) []modelgateway.ToolDefinition {
 							},
 						},
 						"required": []string{"path", "content"},
+					},
+				},
+			},
+			modelgateway.ToolDefinition{
+				Type: "function",
+				Function: modelgateway.ToolFunction{
+					Name:        "run_command",
+					Description: "Run one safe syntax/build/test verification command inside the workspace after edits. Supported families: go test/build/vet, node --check, npx tsc --noEmit, npm test/build, python -m py_compile, pytest.",
+					Parameters: map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"command": map[string]any{
+								"type":        "string",
+								"description": "Exact command to run, without shell chaining.",
+							},
+							"workdir": map[string]any{
+								"type":        "string",
+								"description": "Optional relative or absolute directory inside workspace root.",
+							},
+						},
+						"required": []string{"command"},
 					},
 				},
 			},
@@ -500,7 +571,7 @@ func (s *Services) runSearchCodebaseTool(ctx context.Context, req ChatRequest, r
 	if rootDir == "" {
 		rootDir = strings.TrimSpace(req.RootDir)
 	}
-	searchResp, ragContext := s.buildRAGMaterials(ctx, req.TenantID, rootDir, query, mergedVariants, topK)
+	searchResp, ragContext, _ := s.buildRAGMaterials(ctx, req.TenantID, rootDir, query, mergedVariants, topK)
 	files := make([]string, 0, len(searchResp.Hits))
 	compactHits := make([]map[string]any, 0, len(searchResp.Hits))
 	for _, h := range searchResp.Hits {
@@ -577,39 +648,114 @@ func safeWorkspacePath(rootDir, inputPath string) (string, string, error) {
 	return targetAbs, filepath.ToSlash(rel), nil
 }
 
-func (s *Services) runReadFileTool(req ChatRequest, tc modelgateway.ToolCall) string {
+func (s *Services) runReadFileTool(req ChatRequest, tc modelgateway.ToolCall) (string, string, bool) {
 	args := readFileToolArgs{}
 	if strings.TrimSpace(tc.Function.Arguments) != "" {
 		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
 			b, _ := json.Marshal(map[string]any{"ok": false, "error": "invalid_tool_arguments", "detail": err.Error()})
-			return string(b)
+			return string(b), "", false
 		}
 	}
 	root := s.resolveWorkspaceRoot(req.RootDir)
 	absPath, relPath, err := safeWorkspacePath(root, args.Path)
 	if err != nil {
 		b, _ := json.Marshal(map[string]any{"ok": false, "error": err.Error()})
-		return string(b)
+		return string(b), "", false
 	}
 	body, err := os.ReadFile(absPath)
 	if err != nil {
 		b, _ := json.Marshal(map[string]any{"ok": false, "error": err.Error(), "path": relPath})
-		return string(b)
+		return string(b), "", false
 	}
-	text := string(body)
+	fullText := string(body)
+	text := fullText
 	maxChars := args.MaxChars
 	if maxChars <= 0 {
 		maxChars = 24000
 	}
+	truncated := false
 	if len(text) > maxChars {
 		text = text[:maxChars]
+		truncated = true
 	}
 	b, _ := json.Marshal(map[string]any{
-		"ok":      true,
-		"path":    relPath,
-		"content": text,
+		"ok":          true,
+		"path":        relPath,
+		"truncated":   truncated,
+		"total_chars": len(fullText),
+		"content":     text,
 	})
-	return string(b)
+	return string(b), relPath, !truncated
+}
+
+func readFileRange(absPath string, startLine, endLine, maxChars int) (content string, totalLines int, actual lineRange, err error) {
+	if startLine <= 0 {
+		startLine = 1
+	}
+	if endLine < startLine {
+		endLine = startLine
+	}
+	if maxChars <= 0 {
+		maxChars = 24000
+	}
+
+	body, err := os.ReadFile(absPath)
+	if err != nil {
+		return "", 0, lineRange{}, err
+	}
+	lines := strings.Split(string(body), "\n")
+	totalLines = len(lines)
+	if totalLines == 0 {
+		totalLines = 1
+	}
+	if startLine > totalLines {
+		startLine = totalLines
+	}
+	if endLine > totalLines {
+		endLine = totalLines
+	}
+
+	actual = lineRange{Start: startLine, End: endLine}
+	var b strings.Builder
+	for i := startLine; i <= endLine; i++ {
+		line := fmt.Sprintf("%d: %s\n", i, lines[i-1])
+		if b.Len()+len(line) > maxChars {
+			break
+		}
+		b.WriteString(line)
+	}
+	return strings.TrimRight(b.String(), "\n"), totalLines, actual, nil
+}
+
+func (s *Services) runReadFileRangeTool(req ChatRequest, tc modelgateway.ToolCall) (string, string, lineRange) {
+	args := readFileRangeToolArgs{}
+	if strings.TrimSpace(tc.Function.Arguments) != "" {
+		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+			b, _ := json.Marshal(map[string]any{"ok": false, "error": "invalid_tool_arguments", "detail": err.Error()})
+			return string(b), "", lineRange{}
+		}
+	}
+	root := s.resolveWorkspaceRoot(req.RootDir)
+	absPath, relPath, err := safeWorkspacePath(root, args.Path)
+	if err != nil {
+		b, _ := json.Marshal(map[string]any{"ok": false, "error": err.Error()})
+		return string(b), "", lineRange{}
+	}
+
+	content, totalLines, actual, err := readFileRange(absPath, args.StartLine, args.EndLine, args.MaxChars)
+	if err != nil {
+		b, _ := json.Marshal(map[string]any{"ok": false, "error": err.Error(), "path": relPath})
+		return string(b), "", lineRange{}
+	}
+	b, _ := json.Marshal(map[string]any{
+		"ok":          true,
+		"path":        relPath,
+		"start_line":  actual.Start,
+		"end_line":    actual.End,
+		"total_lines": totalLines,
+		"content":     content,
+	})
+	return string(b), relPath, actual
 }
 
 func (s *Services) runWriteFileTool(req ChatRequest, tc modelgateway.ToolCall) (string, string) {
@@ -644,6 +790,188 @@ func (s *Services) runWriteFileTool(req ChatRequest, tc modelgateway.ToolCall) (
 		"bytes": len(args.Content),
 	})
 	return string(b), relPath
+}
+
+func (s *Services) resolveToolWorkdir(rootDir, workdir string) (string, string, error) {
+	root := s.resolveWorkspaceRoot(rootDir)
+	workdir = strings.TrimSpace(workdir)
+	if workdir == "" {
+		return root, ".", nil
+	}
+	absPath, relPath, err := safeWorkspacePath(root, workdir)
+	if err != nil {
+		return "", "", err
+	}
+	stat, err := os.Stat(absPath)
+	if err != nil {
+		return "", "", err
+	}
+	if !stat.IsDir() {
+		return "", "", fmt.Errorf("workdir must be a directory")
+	}
+	return absPath, relPath, nil
+}
+
+func hasShellMeta(command string) bool {
+	return strings.ContainsAny(command, "&;|><`$\n\r")
+}
+
+func isAllowedVerificationCommand(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case "go":
+		if len(args) < 2 {
+			return false
+		}
+		switch args[1] {
+		case "test", "build", "vet":
+			return true
+		default:
+			return false
+		}
+	case "node":
+		return len(args) >= 3 && args[1] == "--check"
+	case "npm":
+		if len(args) == 2 && args[1] == "test" {
+			return true
+		}
+		return len(args) >= 3 && args[1] == "run" && (args[2] == "test" || args[2] == "build" || args[2] == "lint")
+	case "npx":
+		return len(args) >= 2 && args[1] == "tsc"
+	case "tsc":
+		return true
+	case "python", "python3":
+		return len(args) >= 4 && args[1] == "-m" && args[2] == "py_compile"
+	case "pytest":
+		return true
+	default:
+		return false
+	}
+}
+
+func trimCommandOutput(out string, maxChars int) string {
+	out = strings.TrimSpace(out)
+	if maxChars <= 0 {
+		maxChars = 12000
+	}
+	if len(out) <= maxChars {
+		return out
+	}
+	return out[:maxChars] + "\n...[truncated]"
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func inferVerificationCommand(root string, changedFiles []string) string {
+	if len(changedFiles) == 0 {
+		return ""
+	}
+	hasGo := false
+	hasTS := false
+	hasJS := false
+	hasPy := false
+	firstJS := ""
+	pyFiles := make([]string, 0, len(changedFiles))
+	for _, file := range changedFiles {
+		ext := strings.ToLower(filepath.Ext(file))
+		switch ext {
+		case ".go":
+			hasGo = true
+		case ".ts", ".tsx":
+			hasTS = true
+		case ".js", ".jsx", ".mjs", ".cjs":
+			hasJS = true
+			if firstJS == "" {
+				firstJS = file
+			}
+		case ".py":
+			hasPy = true
+			pyFiles = append(pyFiles, file)
+		}
+	}
+
+	switch {
+	case hasGo && fileExists(filepath.Join(root, "go.mod")):
+		return "go test ./..."
+	case hasTS && fileExists(filepath.Join(root, "tsconfig.json")):
+		return "npx tsc --noEmit"
+	case hasJS && firstJS != "":
+		return "node --check " + firstJS
+	case hasPy && len(pyFiles) > 0:
+		return "python3 -m py_compile " + strings.Join(pyFiles, " ")
+	default:
+		return ""
+	}
+}
+
+func (s *Services) executeVerificationCommand(ctx context.Context, req ChatRequest, command, workdir string) (string, string, bool) {
+	command = strings.TrimSpace(command)
+	if command == "" {
+		b, _ := json.Marshal(map[string]any{"ok": false, "error": "empty command"})
+		return string(b), "", false
+	}
+	if hasShellMeta(command) {
+		b, _ := json.Marshal(map[string]any{"ok": false, "error": "shell metacharacters are not allowed"})
+		return string(b), "", false
+	}
+
+	args := strings.Fields(command)
+	if !isAllowedVerificationCommand(args) {
+		b, _ := json.Marshal(map[string]any{"ok": false, "error": "command not allowed", "command": command})
+		return string(b), "", false
+	}
+
+	dirAbs, dirRel, err := s.resolveToolWorkdir(req.RootDir, workdir)
+	if err != nil {
+		b, _ := json.Marshal(map[string]any{"ok": false, "error": err.Error(), "command": command})
+		return string(b), "", false
+	}
+
+	execCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(execCtx, args[0], args[1:]...)
+	cmd.Dir = dirAbs
+	output, runErr := cmd.CombinedOutput()
+	exitCode := 0
+	if runErr != nil {
+		var exitErr *exec.ExitError
+		if errors.As(runErr, &exitErr) {
+			exitCode = exitErr.ExitCode()
+		} else {
+			exitCode = -1
+		}
+	}
+
+	outText := trimCommandOutput(string(output), 12000)
+	resp := map[string]any{
+		"ok":        runErr == nil,
+		"command":   strings.Join(args, " "),
+		"workdir":   dirRel,
+		"exit_code": exitCode,
+		"output":    outText,
+	}
+	if runErr != nil {
+		resp["error"] = runErr.Error()
+	}
+	b, _ := json.Marshal(resp)
+	return string(b), strings.Join(args, " "), true
+}
+
+func (s *Services) runCommandTool(ctx context.Context, req ChatRequest, tc modelgateway.ToolCall) (string, string, bool) {
+	args := runCommandToolArgs{}
+	if strings.TrimSpace(tc.Function.Arguments) != "" {
+		if err := json.Unmarshal([]byte(tc.Function.Arguments), &args); err != nil {
+			b, _ := json.Marshal(map[string]any{"ok": false, "error": "invalid_tool_arguments", "detail": err.Error()})
+			return string(b), "", false
+		}
+	}
+	return s.executeVerificationCommand(ctx, req, args.Command, args.Workdir)
 }
 
 func (s *Services) loadSessionMemory(ctx context.Context, tenantID, sessionID string) []modelgateway.ChatMessage {
@@ -944,7 +1272,7 @@ func (s *Services) compressHistoryByContextWindow(ctx context.Context, req ChatR
 	return recent, stats
 }
 
-func (s *Services) chatWithFunctionCalling(ctx context.Context, req ChatRequest, rewritten []string, history []modelgateway.ChatMessage) (answer string, evidence []string, changedFiles []string, hitCount int, err error) {
+func (s *Services) chatWithFunctionCalling(ctx context.Context, req ChatRequest, rewritten []string, history []modelgateway.ChatMessage, plan taskPlan) (answer string, evidence []string, changedFiles []string, verificationCommands []string, hitCount int, err error) {
 	// chatWithFunctionCalling 使用 OpenAI-compatible tools/tool_calls 完成“先检索再回答”的真实函数调用流程。
 	// 流程是：
 	// 1) 把 tools schema 发给模型
@@ -953,14 +1281,15 @@ func (s *Services) chatWithFunctionCalling(ctx context.Context, req ChatRequest,
 	// 4) 把工具结果作为 role=tool 消息回给模型
 	// 5) 模型基于工具结果给最终答案
 	if s.Model == nil {
-		return "", nil, nil, 0, fmt.Errorf("model client is nil")
+		return "", nil, nil, nil, 0, fmt.Errorf("model client is nil")
 	}
 
-	tools := buildChatTools(req.Mode)
+	effectiveMode := inferEffectiveMode(req)
+	tools := buildChatTools(effectiveMode)
 	systemPrompt := "You are a coding agent for local repositories. Use the search_codebase tool when the user asks about project/code details. After receiving tool results, answer in Chinese and cite relevant files."
-	mode := strings.ToLower(strings.TrimSpace(req.Mode))
-	if mode == "edit" || mode == "code" || mode == "coding" {
-		systemPrompt = "You are a coding agent for local repositories. In edit mode, inspect files first, then make minimal correct edits using read_file and write_file. Only write files inside the workspace root. After changes, answer in Chinese and summarize exactly which files changed."
+	mode := effectiveMode
+	if mode == "edit" {
+		systemPrompt = "You are a coding agent for local repositories. In edit mode, inspect files first, make minimal correct edits using read_file, read_file_range and write_file, then run at least one verification command with run_command before giving the final answer. Only write files inside the workspace root. Prefer syntax/build/test verification that matches changed files. After verification, answer in Chinese and summarize exactly which files changed and what verification was executed."
 	}
 	messages := []modelgateway.ChatMessage{
 		{
@@ -968,22 +1297,54 @@ func (s *Services) chatWithFunctionCalling(ctx context.Context, req ChatRequest,
 			Content: systemPrompt,
 		},
 	}
+	if controllerText := planToPrompt(plan); controllerText != "" {
+		messages = append(messages, modelgateway.ChatMessage{
+			Role:    "system",
+			Content: controllerText,
+		})
+	}
 	messages = append(messages, history...)
 	messages = append(messages, modelgateway.ChatMessage{
 		Role:    "user",
-		Content: fmt.Sprintf("mode=%s\nuser_task=%s", strings.TrimSpace(req.Mode), strings.TrimSpace(req.Message)),
+		Content: fmt.Sprintf("mode=%s\nuser_task=%s", mode, strings.TrimSpace(req.Message)),
 	})
 
-	for round := 0; round < 3; round++ {
+	roundLimit := 3
+	if mode == "edit" {
+		roundLimit = 6
+	}
+	ranVerification := false
+	inspectionState := newInspectionState(plan)
+
+	for round := 0; round < roundLimit; round++ {
 		// 每一轮都让模型决定：继续调工具，还是直接给答案
 		out, callErr := s.Model.ChatCompletion(ctx, messages, 0.2, tools, "auto")
 		if callErr != nil {
-			return "", evidence, changedFiles, hitCount, callErr
+			return "", evidence, changedFiles, verificationCommands, hitCount, callErr
 		}
 
 		if len(out.ToolCalls) == 0 {
+			if mode == "edit" && len(changedFiles) > 0 && !ranVerification {
+				root := s.resolveWorkspaceRoot(req.RootDir)
+				if autoCmd := inferVerificationCommand(root, unique(changedFiles)); autoCmd != "" {
+					autoContent, usedCmd, executed := s.executeVerificationCommand(ctx, req, autoCmd, "")
+					if executed && usedCmd != "" {
+						ranVerification = true
+						verificationCommands = append(verificationCommands, usedCmd)
+						messages = append(messages, modelgateway.ChatMessage{
+							Role:    "system",
+							Content: "Backend auto verification was executed because you edited files but did not verify them yourself. Use the verification result below before giving the final answer.",
+						})
+						messages = append(messages, modelgateway.ChatMessage{
+							Role:    "user",
+							Content: "自动校验结果如下，请基于结果给出最终中文答复：\n" + autoContent,
+						})
+						continue
+					}
+				}
+			}
 			// 没有 tool_calls 说明模型已经给出最终答案（或至少不再请求工具）
-			return strings.TrimSpace(out.Content), unique(evidence), unique(changedFiles), hitCount, nil
+			return strings.TrimSpace(out.Content), unique(evidence), unique(changedFiles), unique(verificationCommands), hitCount, nil
 		}
 
 		// 把模型发出的 tool_calls 作为 assistant 消息回放回消息历史，符合 function-calling 协议。
@@ -1005,12 +1366,49 @@ func (s *Services) chatWithFunctionCalling(ctx context.Context, req ChatRequest,
 					hitCount = toolHits
 				}
 			case "read_file":
-				toolContent = s.runReadFileTool(req, tc)
+				var relPath string
+				var fullyRead bool
+				toolContent, relPath, fullyRead = s.runReadFileTool(req, tc)
+				if relPath != "" && fullyRead {
+					markFileFullyRead(inspectionState, relPath)
+				}
+			case "read_file_range":
+				var relPath string
+				var actual lineRange
+				toolContent, relPath, actual = s.runReadFileRangeTool(req, tc)
+				if relPath != "" && actual.Start > 0 {
+					markFileRangeRead(inspectionState, relPath, actual)
+				}
 			case "write_file":
+				args := writeFileToolArgs{}
+				if strings.TrimSpace(tc.Function.Arguments) != "" && json.Unmarshal([]byte(tc.Function.Arguments), &args) == nil {
+					root := s.resolveWorkspaceRoot(req.RootDir)
+					if _, relPath, err := safeWorkspacePath(root, args.Path); err == nil {
+						if required := plan.MandatoryRanges[relPath]; len(required) > 0 && !hasReadCoverage(inspectionState, relPath, required) {
+							missing := missingLineRanges(inspectionState, relPath, required)
+							b, _ := json.Marshal(map[string]any{
+								"ok":             false,
+								"error":          "must_read_target_file_before_write",
+								"path":           relPath,
+								"missing_ranges": missing,
+							})
+							toolContent = string(b)
+							break
+						}
+					}
+				}
 				var changed string
 				toolContent, changed = s.runWriteFileTool(req, tc)
 				if changed != "" {
 					changedFiles = append(changedFiles, changed)
+				}
+			case "run_command":
+				var usedCmd string
+				var executed bool
+				toolContent, usedCmd, executed = s.runCommandTool(ctx, req, tc)
+				if executed && usedCmd != "" {
+					ranVerification = true
+					verificationCommands = append(verificationCommands, usedCmd)
 				}
 			default:
 				b, _ := json.Marshal(map[string]any{
@@ -1032,7 +1430,7 @@ func (s *Services) chatWithFunctionCalling(ctx context.Context, req ChatRequest,
 	}
 
 	// 兜底保护：防止模型无限循环调工具
-	return "", unique(evidence), unique(changedFiles), hitCount, fmt.Errorf("tool_call_round_limit_exceeded")
+	return "", unique(evidence), unique(changedFiles), unique(verificationCommands), hitCount, fmt.Errorf("tool_call_round_limit_exceeded")
 }
 
 func (s *Services) Chat(ctx context.Context, req ChatRequest) (ChatResponse, error) {
@@ -1042,17 +1440,19 @@ func (s *Services) Chat(ctx context.Context, req ChatRequest) (ChatResponse, err
 		return ChatResponse{}, errors.New("tenant_id/session_id/user_id/message are required")
 	}
 
+	effectiveMode := inferEffectiveMode(req)
+
 	// 2) 生成 query 变体（当前是启发式示例，后续可换成 LLM query rewrite）
 	rewritten := retrieval.SanitizeQueries(req.Message, []string{ // 合并原始 query + 补充 query，并做去重裁剪
 		"source code architecture",
 		"retrieval pipeline",
-		strings.ToLower(req.Mode),
+		strings.ToLower(effectiveMode),
 	})
 	// 读取最近会话历史（短期记忆），用于提升连续对话质量。
 	history := s.loadSessionMemory(ctx, req.TenantID, req.SessionID)
 
 	// 3) 获取检索材料：优先用 TS retrieve.ts（命中 + context），失败时回退占位结果
-	searchResp, ragContext := s.buildRAGMaterials(ctx, req.TenantID, req.RootDir, req.Message, rewritten, 8)
+	searchResp, ragContext, retrievalStrategy := s.buildRAGMaterials(ctx, req.TenantID, req.RootDir, req.Message, rewritten, 8)
 	// 这里的 searchResp/ragContext 是“预取”结果：
 	// - 给普通 fallback prompt 直接用
 	// - function-calling 成功时也能作为初始 evidence 参考/兜底
@@ -1069,10 +1469,12 @@ func (s *Services) Chat(ctx context.Context, req ChatRequest) (ChatResponse, err
 	candidateHits := len(searchResp.Hits)
 	modelErrors := make([]string, 0, 2)
 	changedFiles := make([]string, 0, 2)
+	verificationCommands := make([]string, 0, 2)
 	effectiveRootDir := s.resolveWorkspaceRoot(req.RootDir)
+	plan := buildTaskPlan(req, effectiveRootDir, evidence)
 	if s.Model != nil {
 		// 优先走真正的 OpenAI-compatible function-calling（工具内部调用 TS RAG）。
-		if fcAnswer, fcEvidence, fcChangedFiles, fcHits, fcErr := s.chatWithFunctionCalling(ctx, req, rewritten, optimizedHistory); fcErr == nil && strings.TrimSpace(fcAnswer) != "" {
+		if fcAnswer, fcEvidence, fcChangedFiles, fcVerificationCommands, fcHits, fcErr := s.chatWithFunctionCalling(ctx, req, rewritten, optimizedHistory, plan); fcErr == nil && strings.TrimSpace(fcAnswer) != "" {
 			// function-calling 成功：用工具执行后返回的答案和 evidence 覆盖预取结果
 			answer = fcAnswer
 			if len(fcEvidence) > 0 {
@@ -1080,6 +1482,9 @@ func (s *Services) Chat(ctx context.Context, req ChatRequest) (ChatResponse, err
 			}
 			if len(fcChangedFiles) > 0 {
 				changedFiles = unique(fcChangedFiles)
+			}
+			if len(fcVerificationCommands) > 0 {
+				verificationCommands = unique(fcVerificationCommands)
 			}
 			if fcHits > 0 {
 				candidateHits = fcHits
@@ -1091,7 +1496,10 @@ func (s *Services) Chat(ctx context.Context, req ChatRequest) (ChatResponse, err
 			}
 			// provider 不支持 tools 或 function-calling 失败时，回退到普通 prompt + 检索上下文模式。
 			prompt := fmt.Sprintf(
-				"Task: %s\nEvidence files: %v\nRetrieved context:\n%s\nReturn concise Chinese answer in Chinese. If context is insufficient, say what is missing.",
+				"Task route: %s\nTask plan: %v\nTarget files: %v\nTask: %s\nEvidence files: %v\nRetrieved context:\n%s\nReturn concise Chinese answer in Chinese. If context is insufficient, say what is missing.",
+				plan.Route,
+				plan.Steps,
+				plan.TargetFiles,
 				req.Message,
 				evidence,
 				strings.TrimSpace(ragContext),
@@ -1141,17 +1549,22 @@ func (s *Services) Chat(ctx context.Context, req ChatRequest) (ChatResponse, err
 		EvidenceFiles: unique(evidence),
 		ChangedFiles:  unique(changedFiles),
 		RetrievalDebug: RetrievalMeta{
-			Query:               req.Message,
-			Rewritten:           rewritten,
-			CandidateHits:       candidateHits,
-			RootDir:             strings.TrimSpace(req.RootDir),
-			ModelContextTokens:  memoryStats.ModelContextTokens,
-			HistoryBeforeTokens: memoryStats.HistoryBefore,
-			HistoryAfterTokens:  memoryStats.HistoryAfter,
-			HistoryBudgetTokens: memoryStats.HistoryBudget,
-			HistoryCompressed:   memoryStats.Compressed,
-			ModelError:          strings.Join(modelErrors, " | "),
-			EffectiveRootDir:    effectiveRootDir,
+			Query:                req.Message,
+			Rewritten:            rewritten,
+			CandidateHits:        candidateHits,
+			RetrievalStrategy:    retrievalStrategy,
+			TaskRoute:            plan.Route,
+			TaskPlan:             plan.Steps,
+			TargetFiles:          plan.TargetFiles,
+			RootDir:              strings.TrimSpace(req.RootDir),
+			ModelContextTokens:   memoryStats.ModelContextTokens,
+			HistoryBeforeTokens:  memoryStats.HistoryBefore,
+			HistoryAfterTokens:   memoryStats.HistoryAfter,
+			HistoryBudgetTokens:  memoryStats.HistoryBudget,
+			HistoryCompressed:    memoryStats.Compressed,
+			ModelError:           strings.Join(modelErrors, " | "),
+			EffectiveRootDir:     effectiveRootDir,
+			VerificationCommands: verificationCommands,
 		},
 	}, nil
 }
@@ -1239,7 +1652,7 @@ func (s *Services) Search(ctx context.Context, req SearchRequest) (SearchRespons
 	}
 
 	// 3) 实际检索：优先走 TS retrieve.ts（本地扫目录 + BM25 融合），失败时回退占位命中
-	resp, _ := s.buildRAGMaterials(ctx, req.TenantID, req.RootDir, req.Query, nil, req.TopK)
+	resp, _, _ := s.buildRAGMaterials(ctx, req.TenantID, req.RootDir, req.Query, nil, req.TopK)
 	if s.Cache != nil {
 		// 写缓存失败不影响主流程
 		_ = s.Cache.SetJSON(ctx, cacheKey, resp, 2*time.Minute) // 写搜索缓存，TTL=2分钟

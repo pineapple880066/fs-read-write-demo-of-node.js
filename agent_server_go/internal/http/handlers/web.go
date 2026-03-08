@@ -11,7 +11,7 @@ import (
 	"agent_server_go/internal/http/response"
 )
 
-// go:embed ui/*
+//go:embed ui/*
 var uiAssets embed.FS
 
 type WebHandler struct {
