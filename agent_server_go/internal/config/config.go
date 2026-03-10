@@ -27,6 +27,10 @@ type Config struct {
 	LLMModel   string
 	// LLMHTTPTimeoutSeconds 控制单次模型 HTTP 请求超时；edit/tool-calling 场景通常需要更长时间。
 	LLMHTTPTimeoutSeconds int
+	// LLMRequestBudgetSeconds 控制单次 chat/edit 请求在模型侧的总预算，避免工具循环无限拖长。
+	LLMRequestBudgetSeconds int
+	LLMRetryMax             int
+	LLMRetryBackoffMS       int
 	// 可选：显式覆盖模型上下文窗口（token），<=0 时自动探测/估算
 	LLMMaxContextTokens int
 	// 安全与限流配置
@@ -40,28 +44,31 @@ type Config struct {
 func Load() Config {
 	// 集中在这里做环境变量读取，避免业务层到处直接取 os.Getenv
 	return Config{
-		AppName:               getEnv("APP_NAME", "agent-server-go"),
-		AppEnv:                getEnv("APP_ENV", "dev"),
-		AppPort:               getEnv("APP_PORT", "8080"),
-		TSRAGNodeBin:          getEnv("TS_RAG_NODE_BIN", "node"),
-		TSRAGScriptPath:       getEnv("TS_RAG_SCRIPT_PATH", "scripts/ts_rag_bridge.mjs"),
-		TSRAGAgentDistDir:     getEnv("TS_RAG_AGENT_DIST_DIR", "../agent/dist"),
-		TSRAGTargetRoot:       getEnv("TS_RAG_TARGET_ROOT_DIR", "."),
-		MySQLDSN:              getEnv("MYSQL_DSN", ""),
-		RedisAddr:             getEnv("REDIS_ADDR", "127.0.0.1:6379"),
-		RedisPass:             getEnv("REDIS_PASSWORD", ""),
-		RabbitMQURL:           getEnv("RABBITMQ_URL", "amqp://guest:guest@127.0.0.1:5672/"),
-		MilvusAddr:            getEnv("MILVUS_ADDR", "127.0.0.1:19530"),
-		LLMBaseURL:            getEnv("LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-		LLMAPIKey:             getEnv("LLM_API_KEY", "sk-6cea20a3640349d6816279e0d0f0dbb1"),
-		LLMModel:              getEnv("LLM_MODEL", "qwen3-coder-plus"),
-		LLMHTTPTimeoutSeconds: getEnvInt("LLM_HTTP_TIMEOUT_SECONDS", 60),
-		LLMMaxContextTokens:   getEnvInt("LLM_MAX_CONTEXT_TOKENS", 0),
-		JWTSecret:             getEnv("JWT_SECRET", "change_me"),
-		RateLimitRPS:          getEnvInt("RATE_LIMIT_RPS", 5),
-		RateBurst:             getEnvInt("RATE_LIMIT_BURST", 10),
-		ChatMemoryMaxMessages: getEnvInt("CHAT_MEMORY_MAX_MESSAGES", 12),
-		ChatMemoryTTLSeconds:  getEnvInt("CHAT_MEMORY_TTL_SECONDS", 1800),
+		AppName:                 getEnv("APP_NAME", "agent-server-go"),
+		AppEnv:                  getEnv("APP_ENV", "dev"),
+		AppPort:                 getEnv("APP_PORT", "8080"),
+		TSRAGNodeBin:            getEnv("TS_RAG_NODE_BIN", "node"),
+		TSRAGScriptPath:         getEnv("TS_RAG_SCRIPT_PATH", "scripts/ts_rag_bridge.mjs"),
+		TSRAGAgentDistDir:       getEnv("TS_RAG_AGENT_DIST_DIR", "../agent/dist"),
+		TSRAGTargetRoot:         getEnv("TS_RAG_TARGET_ROOT_DIR", "."),
+		MySQLDSN:                getEnv("MYSQL_DSN", ""),
+		RedisAddr:               getEnv("REDIS_ADDR", "127.0.0.1:6379"),
+		RedisPass:               getEnv("REDIS_PASSWORD", ""),
+		RabbitMQURL:             getEnv("RABBITMQ_URL", "amqp://guest:guest@127.0.0.1:5672/"),
+		MilvusAddr:              getEnv("MILVUS_ADDR", "127.0.0.1:19530"),
+		LLMBaseURL:              getEnv("LLM_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+		LLMAPIKey:               getEnv("LLM_API_KEY", ""),
+		LLMModel:                getEnv("LLM_MODEL", "qwen3.5-flash"),
+		LLMHTTPTimeoutSeconds:   getEnvInt("LLM_HTTP_TIMEOUT_SECONDS", 60),
+		LLMRequestBudgetSeconds: getEnvInt("LLM_REQUEST_BUDGET_SECONDS", 180),
+		LLMRetryMax:             getEnvInt("LLM_RETRY_MAX", 5),
+		LLMRetryBackoffMS:       getEnvInt("LLM_RETRY_BACKOFF_MS", 1500),
+		LLMMaxContextTokens:     getEnvInt("LLM_MAX_CONTEXT_TOKENS", 0),
+		JWTSecret:               getEnv("JWT_SECRET", "change_me"),
+		RateLimitRPS:            getEnvInt("RATE_LIMIT_RPS", 5),
+		RateBurst:               getEnvInt("RATE_LIMIT_BURST", 10),
+		ChatMemoryMaxMessages:   getEnvInt("CHAT_MEMORY_MAX_MESSAGES", 12),
+		ChatMemoryTTLSeconds:    getEnvInt("CHAT_MEMORY_TTL_SECONDS", 1800),
 	}
 }
 

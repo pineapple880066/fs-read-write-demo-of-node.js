@@ -116,3 +116,64 @@ func TestInspectionCoverageRequiresAllMandatoryRanges(t *testing.T) {
 		t.Fatalf("expected full mandatory coverage")
 	}
 }
+
+func TestResolveMentionedFilePrefersExistingEvidencePath(t *testing.T) {
+	root := t.TempDir()
+	servicePath := filepath.Join(root, "internal", "service")
+	if err := os.MkdirAll(servicePath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(servicePath, "service.go")
+	if err := os.WriteFile(target, []byte("package service\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := resolveMentionedFile(root, "service.go", []string{"internal/service/service.go"})
+	if got != "internal/service/service.go" {
+		t.Fatalf("expected evidence path, got %q", got)
+	}
+}
+
+func TestBuildTaskPlanDetectsSymbolTargetFromEvidence(t *testing.T) {
+	root := t.TempDir()
+	servicePath := filepath.Join(root, "internal", "service")
+	if err := os.MkdirAll(servicePath, 0755); err != nil {
+		t.Fatal(err)
+	}
+	source := `package service
+
+import "context"
+
+func chatWithFunctionCalling(ctx context.Context, msg string) error {
+	answer := ""
+	for round := 0; round < 3; round++ {
+		answer = msg
+	}
+	return nil
+}
+`
+	fullPath := filepath.Join(servicePath, "service.go")
+	if err := os.WriteFile(fullPath, []byte(source), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	req := ChatRequest{
+		Message: "只给 chatWithFunctionCalling 里 tool loop 那一段补中文注释，不改其他地方。",
+		Mode:    "chat",
+		RootDir: root,
+	}
+	plan := buildTaskPlan(req, root, []string{"internal/service/service.go"})
+	if plan.Route != "edit_file" {
+		t.Fatalf("expected edit_file route, got %q", plan.Route)
+	}
+	if len(plan.TargetFiles) != 1 || plan.TargetFiles[0] != "internal/service/service.go" {
+		t.Fatalf("unexpected target files: %+v", plan.TargetFiles)
+	}
+	ranges := plan.MandatoryRanges["internal/service/service.go"]
+	if len(ranges) != 1 {
+		t.Fatalf("expected one narrowed mandatory range, got %+v", ranges)
+	}
+	if ranges[0].Start > 4 || ranges[0].End < 10 {
+		t.Fatalf("expected function range to cover symbol body, got %+v", ranges[0])
+	}
+}

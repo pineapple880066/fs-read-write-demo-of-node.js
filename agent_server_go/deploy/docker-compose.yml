@@ -29,8 +29,11 @@ services:
       TS_RAG_TARGET_ROOT_DIR: "/workspace"
       LLM_BASE_URL: "https://dashscope.aliyuncs.com/compatible-mode/v1"
       LLM_API_KEY: "${LLM_API_KEY:-}"
-      LLM_MODEL: "qwen3-coder-plus"
+      LLM_MODEL: "${LLM_MODEL:-qwen3-coder-plus}"
       LLM_HTTP_TIMEOUT_SECONDS: "${LLM_HTTP_TIMEOUT_SECONDS:-60}"
+      LLM_REQUEST_BUDGET_SECONDS: "${LLM_REQUEST_BUDGET_SECONDS:-180}"
+      LLM_RETRY_MAX: "${LLM_RETRY_MAX:-5}"
+      LLM_RETRY_BACKOFF_MS: "${LLM_RETRY_BACKOFF_MS:-1500}"
       LLM_MAX_CONTEXT_TOKENS: "0"
     ports:
       - "8080:8080"

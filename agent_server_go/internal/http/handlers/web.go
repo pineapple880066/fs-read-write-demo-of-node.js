@@ -35,6 +35,7 @@ func (h *WebHandler) AppJS(c *fiber.Ctx) error {
 }
 
 func (h *WebHandler) Bootstrap(c *fiber.Ctx) error {
+	c.Set("Cache-Control", "no-store, max-age=0")
 	now := time.Now()
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"tenant_id": "local-ui",
@@ -60,6 +61,9 @@ func sendEmbeddedAsset(c *fiber.Ctx, name, fileType string) error {
 	if err != nil {
 		return fiber.NewError(fiber.StatusNotFound, fmt.Sprintf("asset not found: %s", name))
 	}
+	c.Set("Cache-Control", "no-store, max-age=0")
+	c.Set("Pragma", "no-cache")
+	c.Set("Expires", "0")
 	c.Type(fileType, "utf-8")
 	return c.Send(body)
 }

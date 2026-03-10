@@ -128,6 +128,7 @@ Env knobs:
 - `CHAT_MEMORY_MAX_MESSAGES` (default: `12`)
 - `CHAT_MEMORY_TTL_SECONDS` (default: `1800`)
 - `LLM_HTTP_TIMEOUT_SECONDS` (default: `60`)
+- `LLM_REQUEST_BUDGET_SECONDS` (default: `180`)
 - `LLM_MAX_CONTEXT_TOKENS` (default: `0`, means auto-detect/guess)
 
 ### Built-in browser UI

@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -21,6 +24,9 @@ type Client struct {
 	HTTP    *http.Client
 	// MaxContextTokens 可通过配置覆盖；<=0 时会尝试探测并兜底估算。
 	MaxContextTokens int
+	// 重试策略：用于处理上游模型偶发超时/5xx/429。
+	RetryMax     int
+	RetryBackoff time.Duration
 
 	mu                   sync.RWMutex
 	resolvedContextToken int
@@ -93,10 +99,12 @@ func New(baseURL, apiKey, model string) *Client {
 	// New 创建模型网关客户端（OpenAI-compatible HTTP 调用封装）。
 	// 内置 HTTP 超时，避免模型接口超时拖垮请求
 	return &Client{
-		BaseURL: baseURL,
-		APIKey:  apiKey,
-		Model:   model,
-		HTTP:    &http.Client{Timeout: 60 * time.Second},
+		BaseURL:      baseURL,
+		APIKey:       apiKey,
+		Model:        model,
+		HTTP:         &http.Client{Timeout: 60 * time.Second},
+		RetryMax:     5,
+		RetryBackoff: 1500 * time.Millisecond,
 	}
 }
 
@@ -110,6 +118,16 @@ func (c *Client) SetHTTPTimeout(timeout time.Duration) {
 		return
 	}
 	c.HTTP.Timeout = timeout
+}
+
+// SetRetryPolicy 配置模型调用失败后的重试策略。
+func (c *Client) SetRetryPolicy(maxAttempts int, backoff time.Duration) {
+	if maxAttempts > 0 {
+		c.RetryMax = maxAttempts
+	}
+	if backoff > 0 {
+		c.RetryBackoff = backoff
+	}
 }
 
 // SetMaxContextTokens 允许通过配置显式指定模型上下文窗口大小。
@@ -358,36 +376,63 @@ func (c *Client) ChatCompletion(ctx context.Context, messages []ChatMessage, tem
 		return ChatResult{}, fmt.Errorf("missing LLM api key")
 	}
 
-	// 1) 组装请求体
-	payload, _ := json.Marshal(chatReq{Model: c.Model, Messages: messages, Temperature: temperature, Tools: tools, ToolChoice: toolChoice}) // 序列化模型请求体（可携带 tools）
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/chat/completions", bytes.NewReader(payload))                   // 创建带超时/取消能力的 HTTP 请求
-	if err != nil {
-		return ChatResult{}, err
+	attempts := c.RetryMax
+	if attempts <= 0 {
+		attempts = 1
+	}
+	backoff := c.RetryBackoff
+	if backoff <= 0 {
+		backoff = 1500 * time.Millisecond
 	}
 
-	// 2) 设置鉴权与内容类型
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		out, retryable, err := c.chatCompletionOnce(ctx, messages, temperature, tools, toolChoice)
+		if err == nil {
+			return out, nil
+		}
+		lastErr = err
+		if !retryable || attempt == attempts {
+			break
+		}
+		wait := time.Duration(attempt) * backoff
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			return ChatResult{}, ctx.Err()
+		}
+	}
+	return ChatResult{}, lastErr
+}
+
+func (c *Client) chatCompletionOnce(ctx context.Context, messages []ChatMessage, temperature float64, tools []ToolDefinition, toolChoice any) (ChatResult, bool, error) {
+	payload, _ := json.Marshal(chatReq{Model: c.Model, Messages: messages, Temperature: temperature, Tools: tools, ToolChoice: toolChoice})
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/chat/completions", bytes.NewReader(payload))
+	if err != nil {
+		return ChatResult{}, false, err
+	}
+
 	req.Header.Set("Authorization", "Bearer "+c.APIKey)
 	req.Header.Set("Content-Type", "application/json")
 
-	// 3) 发起 HTTP 请求
-	resp, err := c.HTTP.Do(req) // 发起 HTTP 请求到模型网关
+	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return ChatResult{}, err
+		return ChatResult{}, shouldRetryModelError(err), err
 	}
 	defer resp.Body.Close()
 
-	// 只接受 2xx 响应；错误体当前未细分解析
 	if resp.StatusCode/100 != 2 {
-		return ChatResult{}, fmt.Errorf("llm http status: %d", resp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		err := fmt.Errorf("llm http status: %d body=%s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return ChatResult{}, shouldRetryStatus(resp.StatusCode), err
 	}
 
-	// 4) 解析响应并提取第一条内容
 	var out chatResp
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil { // 解析 JSON 响应
-		return ChatResult{}, err
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return ChatResult{}, false, err
 	}
 	if len(out.Choices) == 0 {
-		return ChatResult{}, fmt.Errorf("empty llm choices")
+		return ChatResult{}, false, fmt.Errorf("empty llm choices")
 	}
 	content := ""
 	if out.Choices[0].Message.Content != nil {
@@ -397,5 +442,27 @@ func (c *Client) ChatCompletion(ctx context.Context, messages []ChatMessage, tem
 		Content:      content,
 		ToolCalls:    out.Choices[0].Message.ToolCalls,
 		FinishReason: out.Choices[0].FinishReason,
-	}, nil // 返回第一条候选（文本 + tool_calls）
+	}, false, nil
+}
+
+func shouldRetryStatus(code int) bool {
+	if code == http.StatusRequestTimeout || code == http.StatusTooManyRequests {
+		return true
+	}
+	return code >= 500
+}
+
+func shouldRetryModelError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "timeout") || strings.Contains(text, "temporarily unavailable") || strings.Contains(text, "connection reset")
 }

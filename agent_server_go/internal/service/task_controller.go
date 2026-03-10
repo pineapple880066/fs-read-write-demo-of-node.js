@@ -3,6 +3,9 @@ package service
 import (
 	"bufio"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -22,6 +25,12 @@ type taskPlan struct {
 	MandatoryRanges map[string][]lineRange
 }
 
+type symbolTarget struct {
+	File   string
+	Symbol string
+	Range  lineRange
+}
+
 type fileInspectionState struct {
 	FullRead bool
 	Ranges   []lineRange
@@ -29,6 +38,7 @@ type fileInspectionState struct {
 
 var (
 	fileMentionRe = regexp.MustCompile(`[A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+`)
+	codeSymbolRe  = regexp.MustCompile(`\b[A-Za-z_][A-Za-z0-9_]{2,}\b`)
 )
 
 func inferEffectiveMode(req ChatRequest) string {
@@ -80,6 +90,18 @@ func classifyTaskRoute(req ChatRequest, targetFiles []string) string {
 
 func buildTaskPlan(req ChatRequest, rootDir string, evidence []string) taskPlan {
 	targetFiles := detectTargetFiles(rootDir, req.Message, evidence)
+	symbolTargets := detectSymbolTargets(rootDir, req.Message, evidence)
+	if len(targetFiles) == 0 && len(symbolTargets) > 0 {
+		seen := make(map[string]struct{}, len(symbolTargets))
+		for _, target := range symbolTargets {
+			if _, ok := seen[target.File]; ok {
+				continue
+			}
+			seen[target.File] = struct{}{}
+			targetFiles = append(targetFiles, target.File)
+		}
+		sort.Strings(targetFiles)
+	}
 	route := classifyTaskRoute(req, targetFiles)
 	plan := taskPlan{
 		Route:           route,
@@ -95,12 +117,22 @@ func buildTaskPlan(req ChatRequest, rootDir string, evidence []string) taskPlan 
 			"基于证据给出中文回答",
 		}
 	case "edit_file":
-		plan.Steps = []string{
-			"完整读取目标文件",
-			"如有需要读取相关依赖文件",
-			"最小化修改目标文件",
-			"执行语法或测试校验",
-			"总结变更与校验结果",
+		if len(symbolTargets) > 0 {
+			plan.Steps = []string{
+				"定位目标函数或代码段",
+				"读取目标片段与必要上下文",
+				"最小化修改目标片段",
+				"执行语法或测试校验",
+				"总结变更与校验结果",
+			}
+		} else {
+			plan.Steps = []string{
+				"完整读取目标文件",
+				"如有需要读取相关依赖文件",
+				"最小化修改目标文件",
+				"执行语法或测试校验",
+				"总结变更与校验结果",
+			}
 		}
 	case "fix_file", "fix_and_verify":
 		plan.Steps = []string{
@@ -120,7 +152,19 @@ func buildTaskPlan(req ChatRequest, rootDir string, evidence []string) taskPlan 
 		}
 	}
 
+	symbolRangesByFile := make(map[string][]lineRange, len(symbolTargets))
+	for _, target := range symbolTargets {
+		if target.Range.Start <= 0 || target.Range.End <= 0 {
+			continue
+		}
+		symbolRangesByFile[target.File] = append(symbolRangesByFile[target.File], target.Range)
+	}
+
 	for _, rel := range plan.TargetFiles {
+		if ranges := mergeLineRanges(symbolRangesByFile[rel]); len(ranges) > 0 {
+			plan.MandatoryRanges[rel] = ranges
+			continue
+		}
 		absPath, _, err := safeWorkspacePath(rootDir, rel)
 		if err != nil {
 			continue
@@ -132,6 +176,198 @@ func buildTaskPlan(req ChatRequest, rootDir string, evidence []string) taskPlan 
 		plan.MandatoryRanges[rel] = splitIntoLineRanges(totalLines, 220)
 	}
 	return plan
+}
+
+func detectSymbolTargets(rootDir, message string, evidence []string) []symbolTarget {
+	rootDir = strings.TrimSpace(rootDir)
+	if rootDir == "" {
+		return nil
+	}
+	symbols := extractCodeSymbols(message)
+	if len(symbols) == 0 {
+		return nil
+	}
+
+	out := make([]symbolTarget, 0, 4)
+	seen := make(map[string]struct{}, 4)
+	for _, symbol := range symbols {
+		if target, ok := locateSymbolTarget(rootDir, symbol, evidence); ok {
+			key := target.File + "#" + target.Symbol
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, target)
+		}
+		if len(out) >= 3 {
+			break
+		}
+	}
+	return out
+}
+
+func extractCodeSymbols(message string) []string {
+	raw := codeSymbolRe.FindAllString(message, -1)
+	if len(raw) == 0 {
+		return nil
+	}
+	stop := map[string]struct{}{
+		"internal": {}, "service": {}, "function": {}, "func": {}, "tool": {}, "loop": {}, "read": {}, "write": {},
+		"range": {}, "file": {}, "files": {}, "edit": {}, "fix": {}, "verify": {}, "chat": {}, "with": {}, "the": {},
+	}
+	out := make([]string, 0, len(raw))
+	seen := make(map[string]struct{}, len(raw))
+	for _, item := range raw {
+		if _, skip := stop[strings.ToLower(item)]; skip {
+			continue
+		}
+		// 优先保留更像代码符号的标识符：包含大写、下划线，或长度较长。
+		if !looksLikeCodeSymbol(item) {
+			continue
+		}
+		if _, ok := seen[item]; ok {
+			continue
+		}
+		seen[item] = struct{}{}
+		out = append(out, item)
+	}
+	return out
+}
+
+func looksLikeCodeSymbol(s string) bool {
+	if len(s) >= 12 {
+		return true
+	}
+	if strings.Contains(s, "_") {
+		return true
+	}
+	for _, r := range s {
+		if r >= 'A' && r <= 'Z' {
+			return true
+		}
+	}
+	return false
+}
+
+func locateSymbolTarget(rootDir, symbol string, evidence []string) (symbolTarget, bool) {
+	for _, ev := range evidence {
+		if target, ok := locateSymbolInFile(rootDir, ev, symbol); ok {
+			return target, true
+		}
+	}
+
+	var matches []symbolTarget
+	_ = filepath.WalkDir(rootDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			if _, skip := localRAGSkipDirs[strings.ToLower(d.Name())]; skip {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if len(matches) >= 4 {
+			return errStopLocalWalk
+		}
+		rel, relErr := filepath.Rel(rootDir, path)
+		if relErr != nil {
+			return nil
+		}
+		if target, ok := locateSymbolInFile(rootDir, filepath.ToSlash(rel), symbol); ok {
+			matches = append(matches, target)
+		}
+		return nil
+	})
+	if len(matches) == 1 {
+		return matches[0], true
+	}
+	return symbolTarget{}, false
+}
+
+func locateSymbolInFile(rootDir, relPath, symbol string) (symbolTarget, bool) {
+	absPath, rel, err := safeWorkspacePath(rootDir, relPath)
+	if err != nil {
+		return symbolTarget{}, false
+	}
+	ext := strings.ToLower(filepath.Ext(rel))
+	switch ext {
+	case ".go":
+		if rng, ok := findGoSymbolRange(absPath, symbol); ok {
+			return symbolTarget{File: rel, Symbol: symbol, Range: rng}, true
+		}
+	default:
+		if rng, ok := findTextSymbolRange(absPath, symbol); ok {
+			return symbolTarget{File: rel, Symbol: symbol, Range: rng}, true
+		}
+	}
+	return symbolTarget{}, false
+}
+
+func findGoSymbolRange(path, symbol string) (lineRange, bool) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, path, nil, parser.ParseComments|parser.AllErrors)
+	if err != nil || file == nil {
+		return lineRange{}, false
+	}
+	for _, decl := range file.Decls {
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			if d.Name != nil && d.Name.Name == symbol {
+				return expandLineRange(
+					fset.Position(d.Pos()).Line,
+					fset.Position(d.End()).Line,
+					8,
+				), true
+			}
+		case *ast.GenDecl:
+			for _, spec := range d.Specs {
+				if ts, ok := spec.(*ast.TypeSpec); ok && ts.Name != nil && ts.Name.Name == symbol {
+					return expandLineRange(
+						fset.Position(ts.Pos()).Line,
+						fset.Position(ts.End()).Line,
+						6,
+					), true
+				}
+			}
+		}
+	}
+	return lineRange{}, false
+}
+
+func findTextSymbolRange(path, symbol string) (lineRange, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		return lineRange{}, false
+	}
+	defer f.Close()
+	scanner := bufio.NewScanner(f)
+	lineNo := 0
+	for scanner.Scan() {
+		lineNo++
+		if strings.Contains(scanner.Text(), symbol) {
+			return expandLineRange(lineNo, lineNo, 6), true
+		}
+	}
+	return lineRange{}, false
+}
+
+func expandLineRange(start, end, padding int) lineRange {
+	if start <= 0 {
+		start = 1
+	}
+	if end < start {
+		end = start
+	}
+	if padding < 0 {
+		padding = 0
+	}
+	start -= padding
+	if start <= 0 {
+		start = 1
+	}
+	end += padding
+	return lineRange{Start: start, End: end}
 }
 
 func detectTargetFiles(rootDir, message string, evidence []string) []string {
@@ -167,8 +403,10 @@ func detectTargetFiles(rootDir, message string, evidence []string) []string {
 }
 
 func resolveMentionedFile(rootDir, candidate string, evidence []string) string {
-	if _, rel, err := safeWorkspacePath(rootDir, candidate); err == nil {
-		return rel
+	if abs, rel, err := safeWorkspacePath(rootDir, candidate); err == nil {
+		if stat, statErr := os.Stat(abs); statErr == nil && !stat.IsDir() {
+			return rel
+		}
 	}
 	base := filepath.Base(candidate)
 	if base == "." || base == "/" || base == "" {
