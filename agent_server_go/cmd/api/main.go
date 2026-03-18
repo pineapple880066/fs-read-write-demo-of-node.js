@@ -53,9 +53,14 @@ func main() {
 	}
 
 	// 4) 初始化 Redis（失败时限流/缓存会退化，但服务仍可运行）
-	redisClient := cache.New(cfg.RedisAddr, cfg.RedisPass) // 创建 Redis 客户端
-	if err := redisClient.Ping(ctx); err != nil {          // 检查 Redis 是否可达
-		logger.Printf("redis ping failed: %v", err)
+	var redisClient *cache.Client
+	if cfg.RedisAddr != "" {
+		rdb := cache.New(cfg.RedisAddr, cfg.RedisPass) // 创建 Redis 客户端
+		if err := rdb.Ping(ctx); err != nil {          // 检查 Redis 是否可达
+			logger.Printf("redis ping failed, disable redis-backed features: %v", err)
+		} else {
+			redisClient = rdb
+		}
 	}
 
 	// 5) 初始化 RabbitMQ（失败时异步任务能力不可用，但接口骨架仍可工作）
